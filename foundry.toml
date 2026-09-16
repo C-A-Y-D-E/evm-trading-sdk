@@ -1,0 +1,12 @@
+[profile.default]
+src = "contracts/src"
+test = "contracts/test"
+out = "target/forge"
+cache_path = "target/forge-cache"
+solc_version = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+
+[profile.fork]
+test = "contracts/fork"

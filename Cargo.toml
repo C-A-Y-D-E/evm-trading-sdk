@@ -1,0 +1,21 @@
+[package]
+name = "evm-trading-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "An EVM trading SDK, starting with Robinhood Chain"
+
+[dependencies]
+alloy-primitives = { version = "1.5.7", default-features = false, features = ["std"] }
+alloy-provider = { version = "=1.7.3", default-features = false }
+alloy-rpc-types-eth = "=1.7.3"
+alloy-sol-types = "=1.5.4"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+alloy-provider = { version = "=1.7.3", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
+# Match the provider's reqwest 0.12 client; Alloy 1.8 uses an incompatible client type.
+alloy-rpc-client = { version = "=1.7.3", default-features = false }
+alloy-transport-http = { version = "=1.7.3", default-features = false }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }

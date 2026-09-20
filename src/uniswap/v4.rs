@@ -8,6 +8,7 @@ use alloy_primitives::{
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{BlockId, Filter, Log, TransactionRequest};
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
+use futures_util::try_join;
 
 use super::{
     DiscoveryFailure, DiscoveryOutcome, SearchCoverage, SearchScope, V4Deployment, V4Pool,
@@ -91,15 +92,18 @@ impl<P: Provider> UniswapV4<P> {
         deployment: V4Deployment,
         block: B256,
     ) -> Result<Self> {
-        for address in [deployment.pool_manager, deployment.permit2] {
-            client.require_contract(address, block).await?;
-        }
-        for address in [
-            deployment.universal_router,
-            deployment.quoter,
-            deployment.state_view,
+        let (_, _, router_manager, quoter_manager, view_manager) = try_join!(
+            client.require_contract(deployment.pool_manager, block),
+            client.require_contract(deployment.permit2, block),
+            client.call(deployment.universal_router, abi::poolManagerCall {}, block),
+            client.call(deployment.quoter, abi::poolManagerCall {}, block),
+            client.call(deployment.state_view, abi::poolManagerCall {}, block),
+        )?;
+        for (address, manager) in [
+            (deployment.universal_router, router_manager),
+            (deployment.quoter, quoter_manager),
+            (deployment.state_view, view_manager),
         ] {
-            let manager = client.call(address, abi::poolManagerCall {}, block).await?;
             if manager != deployment.pool_manager {
                 return Err(Error::UnsupportedDeployment(address));
             }
@@ -397,7 +401,8 @@ impl<P: Provider> Dex for UniswapV4<P> {
         let request = &quote.request;
         let trade = &request.trade;
         let (input, output, zero_for_one) = self.validate_trade(&request.pool, trade)?;
-        if limits.minimum_amount_out > U256::from(u128::MAX)
+        let minimum_amount_out = limits.minimum_amount_out(quote.amount_out)?;
+        if minimum_amount_out > U256::from(u128::MAX)
             || limits.deadline_unix_seconds > U48::MAX.to::<u64>()
         {
             return Err(Error::InvalidTrade(
@@ -416,7 +421,7 @@ impl<P: Provider> Dex for UniswapV4<P> {
                 poolKey: (&request.pool.key).into(),
                 zeroForOne: zero_for_one,
                 amountIn: trade.amount_in.to::<u128>(),
-                amountOutMinimum: limits.minimum_amount_out.to::<u128>(),
+                amountOutMinimum: minimum_amount_out.to::<u128>(),
                 minHopPriceX36: U256::ZERO,
                 hookData: request.options.hook_data.clone(),
             }

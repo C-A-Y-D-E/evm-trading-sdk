@@ -6,6 +6,7 @@ use alloy_primitives::{
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, SolValue, sol};
+use futures_util::{future::join_all, try_join};
 
 use crate::{
     EvmClient,
@@ -51,27 +52,19 @@ impl<P: Provider> UniswapV3<P> {
         deployment: V3Deployment,
         block_hash: B256,
     ) -> Result<Self> {
-        client
-            .require_contract(deployment.factory, block_hash)
-            .await?;
-        let router_factory = client
-            .call(deployment.swap_router_02, abi::factoryCall {}, block_hash)
-            .await?;
+        let (_, router_factory, wrapped_native, quoter_factory, quoter_wrapped_native) = try_join!(
+            client.require_contract(deployment.factory, block_hash),
+            client.call(deployment.swap_router_02, abi::factoryCall {}, block_hash),
+            client.call(deployment.swap_router_02, abi::WETH9Call {}, block_hash),
+            client.call(deployment.quoter_v2, abi::factoryCall {}, block_hash),
+            client.call(deployment.quoter_v2, abi::WETH9Call {}, block_hash),
+        )?;
         if router_factory != deployment.factory {
             return Err(Error::UnsupportedDeployment(router_factory));
         }
-        let wrapped_native = client
-            .call(deployment.swap_router_02, abi::WETH9Call {}, block_hash)
-            .await?;
-        let quoter_factory = client
-            .call(deployment.quoter_v2, abi::factoryCall {}, block_hash)
-            .await?;
         if quoter_factory != deployment.factory {
             return Err(Error::UnsupportedDeployment(quoter_factory));
         }
-        let quoter_wrapped_native = client
-            .call(deployment.quoter_v2, abi::WETH9Call {}, block_hash)
-            .await?;
         if quoter_wrapped_native != wrapped_native {
             return Err(Error::UnsupportedDeployment(deployment.quoter_v2));
         }
@@ -98,29 +91,17 @@ impl<P: Provider> Dex for UniswapV3<P> {
         if address.is_zero() {
             return Err(Error::PoolNotFound);
         }
-        let factory = self
-            .client
-            .call(address, abi::factoryCall {}, block_hash)
-            .await?;
+        let (factory, token0, token1, fee, tick_spacing) = try_join!(
+            self.client.call(address, abi::factoryCall {}, block_hash),
+            self.client.call(address, abi::token0Call {}, block_hash),
+            self.client.call(address, abi::token1Call {}, block_hash),
+            self.client.call(address, abi::feeCall {}, block_hash),
+            self.client
+                .call(address, abi::tickSpacingCall {}, block_hash),
+        )?;
         if factory != self.deployment.factory {
             return Err(Error::UnsupportedDeployment(factory));
         }
-        let token0 = self
-            .client
-            .call(address, abi::token0Call {}, block_hash)
-            .await?;
-        let token1 = self
-            .client
-            .call(address, abi::token1Call {}, block_hash)
-            .await?;
-        let fee = self
-            .client
-            .call(address, abi::feeCall {}, block_hash)
-            .await?;
-        let tick_spacing = self
-            .client
-            .call(address, abi::tickSpacingCall {}, block_hash)
-            .await?;
         let pool = V3Pool {
             chain_id: self.client.chain_id(),
             factory,
@@ -213,7 +194,7 @@ impl<P: Provider> Dex for UniswapV3<P> {
                 } else {
                     U256::ZERO
                 }),
-                input: self.swap_calldata(request, path, limits).into(),
+                input: self.swap_calldata(quote, path, limits)?.into(),
                 ..Default::default()
             },
             approval,
@@ -239,9 +220,16 @@ impl<P: Provider> DiscoverPools for UniswapV3<P> {
         };
         let mut pools = Vec::new();
         let mut failures = Vec::new();
-        for fee in &query.fee_tiers {
+        let results = join_all(
+            query
+                .fee_tiers
+                .iter()
+                .map(|fee| self.find_pool(path, *fee, block_hash)),
+        )
+        .await;
+        for (fee, result) in query.fee_tiers.iter().zip(results) {
             let scope = SearchScope::V3FeeTier(*fee);
-            match self.find_pool(path, *fee, block_hash).await {
+            match result {
                 Ok(pool) => {
                     pools.extend(pool);
                     coverage.completed.push(scope);
@@ -378,10 +366,12 @@ impl<P: Provider> UniswapV3<P> {
 
     fn swap_calldata(
         &self,
-        request: &QuoteRequest<V3Pool>,
+        quote: &Quote<V3Pool>,
         path: [Address; 2],
         limits: SwapLimits,
-    ) -> Bytes {
+    ) -> Result<Bytes> {
+        let request = &quote.request;
+        let minimum_amount_out = limits.minimum_amount_out(quote.amount_out)?;
         let trade = &request.trade;
         let native_output = trade.currency_out == Currency::Native;
         let aliased_recipient = matches!(trade.recipient, ROUTER_SENDER | ROUTER_SELF);
@@ -397,7 +387,7 @@ impl<P: Provider> UniswapV3<P> {
                 fee: request.pool.fee,
                 recipient,
                 amountIn: trade.amount_in,
-                amountOutMinimum: limits.minimum_amount_out,
+                amountOutMinimum: minimum_amount_out,
                 sqrtPriceLimitX96: U160::ZERO,
             },
         };
@@ -405,7 +395,7 @@ impl<P: Provider> UniswapV3<P> {
         if native_output {
             data.push(
                 abi::unwrapWETH9Call {
-                    amountMinimum: limits.minimum_amount_out,
+                    amountMinimum: minimum_amount_out,
                     recipient: trade.recipient,
                 }
                 .abi_encode()
@@ -416,7 +406,7 @@ impl<P: Provider> UniswapV3<P> {
             data.push(
                 abi::sweepTokenCall {
                     token: path[1],
-                    amountMinimum: limits.minimum_amount_out,
+                    amountMinimum: minimum_amount_out,
                     recipient: trade.recipient,
                 }
                 .abi_encode()
@@ -427,12 +417,12 @@ impl<P: Provider> UniswapV3<P> {
             data.push(abi::refundETHCall {}.abi_encode().into());
         }
         // SwapRouter02 has no deadline in its swap tuple; the multicall enforces it.
-        abi::multicallCall {
+        Ok(abi::multicallCall {
             deadline: U256::from(limits.deadline_unix_seconds),
             data,
         }
         .abi_encode()
-        .into()
+        .into())
     }
 }
 

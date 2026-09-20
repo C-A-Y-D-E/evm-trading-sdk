@@ -50,6 +50,8 @@ async fn deployment_must_use_the_same_manager() {
     code(&rpc);
     code(&rpc);
     returned(&rpc, Address::repeat_byte(9));
+    returned(&rpc, deployment().pool_manager);
+    returned(&rpc, deployment().pool_manager);
     assert!(matches!(
         UniswapV4::connect(client, deployment(), BLOCK).await,
         Err(Error::UnsupportedDeployment(_))
@@ -85,7 +87,17 @@ async fn quotes_keep_the_selected_hook_data() {
     let swap = Swap::abi_decode_validate(&params[0]).unwrap();
     assert_eq!(swap.hookData, quote.request.options.hook_data);
     assert_eq!(swap.amountIn, 1000);
-    assert_eq!(swap.amountOutMinimum, 850);
+    assert_eq!(swap.amountOutMinimum, 855);
+    assert!(matches!(
+        adapter.build_swap(
+            &quote,
+            SwapLimits {
+                slippage_bps: 10001,
+                ..limits()
+            }
+        ),
+        Err(Error::InvalidTrade(_))
+    ));
     assert_eq!(swap.minHopPriceX36, U256::ZERO);
     assert!(swap.zeroForOne);
     assert_eq!((swap.poolKey.currency0, swap.poolKey.currency1), (NVDA, AC));
@@ -330,7 +342,7 @@ fn fixture_quote() -> Quote<V4Pool, V4QuoteOptions> {
 }
 fn limits() -> SwapLimits {
     SwapLimits {
-        minimum_amount_out: U256::from(850),
+        slippage_bps: 500,
         deadline_unix_seconds: 1000,
     }
 }

@@ -113,13 +113,7 @@ contract RobinhoodForkTest {
 
     function testFeeRouterExecutesV3AndV4InOneCall() public {
         address feeRecipient = address(0xf33);
-        FeeRouter feeRouter = new FeeRouter(
-            feeRecipient,
-            WETH,
-            address(bytes20(hex"89e5db8b5aa49aa85ac63f691524311aeb649eba")),
-            V3,
-            address(bytes20(hex"8366a39cc670b4001a1121b8f6a443a643e40951"))
-        );
+        FeeRouter feeRouter = _deployFeeRouter(feeRecipient);
         ForkToken(WETH).deposit{value: 0.04 ether}();
         ForkToken(WETH).approve(address(feeRouter), 0.04 ether);
         FeeRouter.Hop[] memory hops = new FeeRouter.Hop[](2);
@@ -158,13 +152,7 @@ contract RobinhoodForkTest {
         require(expectedOutput > 0, "GTAVI quote");
 
         address feeRecipient = address(0xf33);
-        FeeRouter feeRouter = new FeeRouter(
-            feeRecipient,
-            WETH,
-            address(bytes20(hex"89e5db8b5aa49aa85ac63f691524311aeb649eba")),
-            V3,
-            address(bytes20(hex"8366a39cc670b4001a1121b8f6a443a643e40951"))
-        );
+        FeeRouter feeRouter = _deployFeeRouter(feeRecipient);
         ForkToken(WETH).deposit{value: 0.04 ether}();
         ForkToken(WETH).approve(address(feeRouter), 0.04 ether);
         FeeRouter.Hop[] memory hops = new FeeRouter.Hop[](2);
@@ -192,5 +180,16 @@ contract RobinhoodForkTest {
         emit log_named_uint("TTWO quote (18 decimals)", ttwoQuote);
         emit log_named_uint("GTAVI quote (18 decimals)", expectedOutput);
         emit log_named_uint("GTAVI received (18 decimals)", output);
+    }
+
+    function _deployFeeRouter(address feeRecipient) private returns (FeeRouter) {
+        return new FeeRouter(
+            address(this),
+            feeRecipient,
+            WETH,
+            address(bytes20(hex"89e5db8b5aa49aa85ac63f691524311aeb649eba")),
+            V3,
+            address(bytes20(hex"8366a39cc670b4001a1121b8f6a443a643e40951"))
+        );
     }
 }

@@ -2,7 +2,7 @@ use alloy_primitives::{Address, B256, U256, address, aliases::U24};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use evm_trading_sdk::{
-    Dex, DiscoverPools, EvmClient, Result,
+    Dex, DiscoverPools, EvmClient, FeeRouter, Result,
     dex::{Currency, ExactInput, QuoteRequest},
     uniswap::{
         DiscoveryOutcome, UniswapDeployment,
@@ -10,6 +10,7 @@ use evm_trading_sdk::{
         v3::{UniswapV3, V3PoolQuery},
     },
 };
+use futures_util::{future::join_all, join};
 
 const RPC_URL: &str = "https://rpc.mainnet.chain.robinhood.com";
 const USDG: Address = address!("5fc5360d0400a0fd4f2af552add042d716f1d168");
@@ -56,8 +57,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("Chain {} at block {block}", deployment.chain_id);
     println!("Input: {amount_in} USDG base units; output token: {token_out}; wallet: {WALLET}");
     println!("Quote only; no wallet balance requirement or swap simulation.");
-    for token in [USDG, token_out] {
-        match client.token_info(token, block).await {
+    let tokens = [USDG, token_out];
+    let metadata = join_all(tokens.iter().map(|token| client.token_info(*token, block)));
+    let (metadata, router) = join!(metadata, FeeRouter::connect(client.clone(), block));
+    for (token, result) in tokens.into_iter().zip(metadata) {
+        match result {
             Ok(info) => println!(
                 "Token {token}: symbol={:?}, decimals={:?}",
                 info.symbol, info.decimals
@@ -65,62 +69,83 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Err(error) => println!("Token {token} metadata failed: {error:?}"),
         }
     }
+    let router = router?;
+    println!(
+        "FeeRouter {}: {} bps, {} input base units after fee",
+        router.address(),
+        router.fee_bps(),
+        router.amount_after_fee(amount_in)
+    );
     let trade = ExactInput {
         chain_id: deployment.chain_id,
         currency_in: Currency::Erc20(USDG),
         currency_out: Currency::Erc20(token_out),
-        amount_in,
+        amount_in: router.amount_after_fee(amount_in),
         sender: WALLET,
         recipient: WALLET,
     };
-    let mut quotes = Vec::new();
-    if let Some(config) = deployment.v2 {
-        match UniswapV2::connect(client.clone(), config, block).await {
-            Ok(adapter) => {
-                let query = V2PoolQuery {
-                    chain_id: trade.chain_id,
-                    currency_a: trade.currency_in,
-                    currency_b: trade.currency_out,
-                };
-                match adapter.find_pools(query, block).await {
-                    Ok(search) => {
-                        for pool in print_search("V2", search.outcome) {
-                            let address = pool.address;
-                            let result = quote_pool(&adapter, pool, &trade, block).await;
-                            record_quote("V2", address, result, &mut quotes);
+    let v2_quotes = async {
+        let mut quotes = Vec::new();
+        if let Some(config) = deployment.v2 {
+            match UniswapV2::connect(client.clone(), config, block).await {
+                Ok(adapter) => {
+                    let query = V2PoolQuery {
+                        chain_id: trade.chain_id,
+                        currency_a: trade.currency_in,
+                        currency_b: trade.currency_out,
+                    };
+                    match adapter.find_pools(query, block).await {
+                        Ok(search) => {
+                            let pools = print_search("V2", search.outcome);
+                            let results = quote_pools(&adapter, &pools, &trade, block).await;
+                            for (pool, result) in pools.into_iter().zip(results) {
+                                let address = pool.address;
+                                record_quote("V2", address, result, &mut quotes);
+                            }
                         }
+                        Err(error) => println!("V2 discovery failed: {error:?}"),
                     }
-                    Err(error) => println!("V2 discovery failed: {error:?}"),
                 }
+                Err(error) => println!("V2 connection failed: {error:?}"),
             }
-            Err(error) => println!("V2 connection failed: {error:?}"),
         }
-    }
-    if let Some(config) = deployment.v3 {
-        match UniswapV3::connect(client, config, block).await {
-            Ok(adapter) => {
-                let query = V3PoolQuery {
-                    chain_id: trade.chain_id,
-                    currency_a: trade.currency_in,
-                    currency_b: trade.currency_out,
-                    fee_tiers: [100, 500, 3000, 10_000].map(U24::from).to_vec(),
-                };
-                match adapter.find_pools(query, block).await {
-                    Ok(search) => {
-                        for pool in print_search("V3", search.outcome) {
-                            let address = pool.address;
-                            println!("V3 pool {address}, fee tier {}", pool.fee);
-                            let result = quote_pool(&adapter, pool, &trade, block).await;
-                            record_quote("V3", address, result, &mut quotes);
+        quotes
+    };
+    let v3_quotes = async {
+        let mut quotes = Vec::new();
+        if let Some(config) = deployment.v3 {
+            match UniswapV3::connect(client.clone(), config, block).await {
+                Ok(adapter) => {
+                    let query = V3PoolQuery {
+                        chain_id: trade.chain_id,
+                        currency_a: trade.currency_in,
+                        currency_b: trade.currency_out,
+                        fee_tiers: [100, 500, 3000, 10_000].map(U24::from).to_vec(),
+                    };
+                    match adapter.find_pools(query, block).await {
+                        Ok(search) => {
+                            let pools = print_search("V3", search.outcome);
+                            let results = quote_pools(&adapter, &pools, &trade, block).await;
+                            for (pool, result) in pools.into_iter().zip(results) {
+                                let address = pool.address;
+                                println!("V3 pool {address}, fee tier {}", pool.fee);
+                                record_quote("V3", address, result, &mut quotes);
+                            }
                         }
+                        Err(error) => println!("V3 discovery failed: {error:?}"),
                     }
-                    Err(error) => println!("V3 discovery failed: {error:?}"),
                 }
+                Err(error) => println!("V3 connection failed: {error:?}"),
             }
-            Err(error) => println!("V3 connection failed: {error:?}"),
         }
-    }
-    match quotes.into_iter().max_by_key(|(_, amount)| *amount) {
+        quotes
+    };
+    let (v2_quotes, v3_quotes) = join!(v2_quotes, v3_quotes);
+    match v2_quotes
+        .into_iter()
+        .chain(v3_quotes)
+        .max_by_key(|(_, amount)| *amount)
+    {
         Some((pool, amount)) => println!(
             "Highest output among successful quotes: {amount} output base units via {pool}; excludes gas."
         ),
@@ -155,21 +180,28 @@ fn print_search<P>(version: &str, outcome: DiscoveryOutcome<P>) -> Vec<P> {
     }
 }
 
-async fn quote_pool<D: Dex<QuoteOptions = ()>>(
+async fn quote_pools<D: Dex<QuoteOptions = ()>>(
     adapter: &D,
-    pool: D::Pool,
+    pools: &[D::Pool],
     trade: &ExactInput,
     block_hash: B256,
-) -> Result<U256> {
-    let quote = adapter
-        .quote(QuoteRequest {
+) -> Vec<Result<U256>> {
+    let requests = pools
+        .iter()
+        .cloned()
+        .map(|pool| QuoteRequest {
             pool,
             trade: trade.clone(),
             block_hash,
             options: (),
         })
-        .await?;
-    Ok(quote.amount_out)
+        .collect();
+    adapter
+        .quote_many(requests)
+        .await
+        .into_iter()
+        .map(|result| result.map(|quote| quote.amount_out))
+        .collect()
 }
 
 fn record_quote(

@@ -72,7 +72,7 @@ async fn loading_requires_both_factory_registration_and_the_canonical_address() 
 }
 
 #[tokio::test]
-async fn token_swap_keeps_the_deadline_stricter_minimum_and_approval_target() {
+async fn token_swap_keeps_the_deadline_slippage_and_approval_target() {
     let (adapter, rpc) = adapter().await;
     let quote = quote(
         &adapter,
@@ -82,7 +82,7 @@ async fn token_swap_keeps_the_deadline_stricter_minimum_and_approval_target() {
     )
     .await;
     let mut limits = limits();
-    limits.minimum_amount_out = U256::from(950);
+    limits.slippage_bps = 0;
     let plan = adapter.build_swap(&quote, limits).unwrap();
     let batch = batch(&plan);
     let swap = exactInputSingleCall::abi_decode_validate(&batch.data[0])
@@ -98,7 +98,7 @@ async fn token_swap_keeps_the_deadline_stricter_minimum_and_approval_target() {
     );
     assert_eq!(
         (swap.amountIn, swap.amountOutMinimum),
-        (U256::from(1_000), U256::from(950))
+        (U256::from(1_000), U256::from(900))
     );
     assert_eq!(swap.sqrtPriceLimitX96, U160::ZERO);
     assert_eq!(swap.recipient, RECIPIENT);
@@ -106,6 +106,16 @@ async fn token_swap_keeps_the_deadline_stricter_minimum_and_approval_target() {
     assert_eq!(plan.transaction.to, Some(ROUTER.into()));
     assert_eq!(plan.transaction.chain_id, Some(ROBINHOOD_CHAIN_ID));
     assert_eq!(plan.transaction.value.unwrap_or_default(), U256::ZERO);
+    assert!(matches!(
+        adapter.build_swap(
+            &quote,
+            SwapLimits {
+                slippage_bps: 10001,
+                ..limits
+            }
+        ),
+        Err(Error::InvalidTrade(_))
+    ));
     let approval = plan.approval.unwrap();
     assert_eq!(
         (
@@ -135,7 +145,7 @@ async fn native_buy_attaches_value_and_refunds_unused_eth() {
         (WETH, TOKEN, RECIPIENT)
     );
     assert_eq!(swap.amountIn, U256::from(1_000));
-    assert_eq!(swap.amountOutMinimum, U256::from(850));
+    assert_eq!(swap.amountOutMinimum, U256::from(855));
     assert_eq!(plan.transaction.value, Some(U256::from(1_000)));
     assert!(plan.approval.is_none());
 }
@@ -158,7 +168,7 @@ async fn native_sell_unwraps_the_reverse_swap_to_the_requested_recipient() {
     );
     assert_eq!(
         (unwrap.recipient, unwrap.amountMinimum),
-        (RECIPIENT, U256::from(850))
+        (RECIPIENT, U256::from(855))
     );
     assert_eq!(plan.transaction.value.unwrap_or_default(), U256::ZERO);
     assert_eq!(plan.approval.unwrap().token, TOKEN);
@@ -190,7 +200,7 @@ async fn literal_recipients_are_not_reinterpreted_as_router_aliases() {
             let sweep = sweepTokenCall::abi_decode_validate(&batch.data[1]).unwrap();
             assert_eq!(
                 (sweep.token, sweep.recipient, sweep.amountMinimum),
-                (TOKEN, recipient, U256::from(850))
+                (TOKEN, recipient, U256::from(855))
             );
         }
     }
@@ -451,7 +461,7 @@ async fn quote(
 
 fn limits() -> SwapLimits {
     SwapLimits {
-        minimum_amount_out: U256::from(850),
+        slippage_bps: 500,
         deadline_unix_seconds: 2_000_000_000,
     }
 }

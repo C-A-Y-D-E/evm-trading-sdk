@@ -1,18 +1,31 @@
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, address};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
+use futures_util::try_join;
+
+mod trader;
+pub use trader::{
+    BuyWith, FundingQuoteFailure, FundingReport, PairSwap, PreparedSwap, TradeSide, Trader,
+};
 
 use crate::{
     EvmClient,
-    dex::{Currency, Error, ExactInput, Result, SwapLimits, SwapTransaction, TokenApproval},
+    dex::{Currency, Error, Quote, Result, SwapLimits, SwapTransaction, TokenApproval},
     uniswap::UniswapPool,
 };
+
+pub const ROBINHOOD_FEE_ROUTER: Address = address!("dda62d6b81689bede84170d1a88838d1f7ab1d4d");
+
+// No verified Robinhood USDC deployment yet. USDG is a different asset and must not substitute.
+pub const ROBINHOOD_USDC: Option<Address> = None;
 
 pub struct FeeRouter<P: Provider> {
     client: EvmClient<P>,
     address: Address,
     fee_recipient: Address,
+    fee_bps: u16,
+    configuration_block: B256,
     wrapped_native: Address,
     v2_factory: Address,
     v3_factory: Address,
@@ -27,53 +40,110 @@ pub struct RouteHop {
     pub hook_data: Bytes,
 }
 
-pub fn input_fee(amount: U256) -> U256 {
-    amount / U256::from(100)
+pub fn input_fee(amount: U256, fee_bps: u16) -> Result<U256> {
+    if fee_bps > 10_000 {
+        return Err(Error::InvalidTrade("fee exceeds 10000 basis points".into()));
+    }
+    Ok(calculate_fee(amount, fee_bps))
 }
-pub fn amount_after_fee(amount: U256) -> U256 {
-    amount - input_fee(amount)
+pub fn amount_after_fee(amount: U256, fee_bps: u16) -> Result<U256> {
+    Ok(amount - input_fee(amount, fee_bps)?)
+}
+
+fn calculate_fee(amount: U256, fee_bps: u16) -> U256 {
+    let denominator = U256::from(10_000);
+    let rate = U256::from(fee_bps);
+    amount / denominator * rate + amount % denominator * rate / denominator
 }
 
 impl<P: Provider> FeeRouter<P> {
-    pub async fn connect(client: EvmClient<P>, address: Address, block: B256) -> Result<Self> {
-        client.require_contract(address, block).await?;
-        if client.call(address, abi::FEE_BPSCall {}, block).await? != U256::from(100) {
+    pub fn trader(&self, wallet: Address) -> Trader<'_, P> {
+        Trader::new(self, wallet)
+    }
+
+    /// Connects to our deployed router and reads its configuration at the quote block.
+    pub async fn connect(client: EvmClient<P>, block: B256) -> Result<Self> {
+        let address = match client.chain_id() {
+            crate::ROBINHOOD_CHAIN_ID => ROBINHOOD_FEE_ROUTER,
+            chain_id => {
+                return Err(Error::NotConfigured {
+                    chain_id,
+                    requirement: "FeeRouter",
+                });
+            }
+        };
+        let (_, fee_bps, fee_recipient, wrapped_native, v2_factory, v3_factory, pool_manager) = try_join!(
+            client.require_contract(address, block),
+            client.call(address, abi::FEE_BPSCall {}, block),
+            client.call(address, abi::feeRecipientCall {}, block),
+            client.call(address, abi::wrappedNativeCall {}, block),
+            client.call(address, abi::v2FactoryCall {}, block),
+            client.call(address, abi::v3FactoryCall {}, block),
+            client.call(address, abi::poolManagerCall {}, block),
+        )?;
+        if fee_bps > U256::from(10_000) {
             return Err(Error::UnsupportedDeployment(address));
         }
         Ok(Self {
-            fee_recipient: client
-                .call(address, abi::feeRecipientCall {}, block)
-                .await?,
-            wrapped_native: client
-                .call(address, abi::wrappedNativeCall {}, block)
-                .await?,
-            v2_factory: client.call(address, abi::v2FactoryCall {}, block).await?,
-            v3_factory: client.call(address, abi::v3FactoryCall {}, block).await?,
-            pool_manager: client.call(address, abi::poolManagerCall {}, block).await?,
+            fee_bps: fee_bps.to::<u16>(),
+            configuration_block: block,
+            fee_recipient,
+            wrapped_native,
+            v2_factory,
+            v3_factory,
+            pool_manager,
             client,
             address,
         })
+    }
+
+    pub fn address(&self) -> Address {
+        self.address
     }
 
     pub fn fee_recipient(&self) -> Address {
         self.fee_recipient
     }
 
-    /// Quote the first hop using amount_after_fee. The minimum is final output after all hops.
+    pub fn fee_bps(&self) -> u16 {
+        self.fee_bps
+    }
+
+    pub fn configuration_block(&self) -> B256 {
+        self.configuration_block
+    }
+
+    pub fn input_fee(&self, amount: U256) -> U256 {
+        calculate_fee(amount, self.fee_bps)
+    }
+
+    pub fn amount_after_fee(&self, amount: U256) -> U256 {
+        amount - self.input_fee(amount)
+    }
+
+    /// The route quote keeps gross trade input and final output quoted after the input fee.
     /// This encodes a selected route; it does not discover, quote, or simulate that route.
+    /// Connect at the quote block; swapWithFee rejects a different rate at execution.
     pub fn build_swap(
         &self,
-        trade: &ExactInput,
-        hops: &[RouteHop],
+        quote: &Quote<Vec<RouteHop>>,
         limits: SwapLimits,
     ) -> Result<SwapTransaction> {
+        let trade = &quote.request.trade;
+        let hops = &quote.request.pool;
+        if quote.request.block_hash != self.configuration_block {
+            return Err(Error::InvalidTrade(
+                "route quote and fee must use the same block".into(),
+            ));
+        }
+        let minimum_amount_out = limits.minimum_amount_out(quote.amount_out)?;
         if trade.chain_id != self.client.chain_id() {
             return Err(Error::ChainMismatch {
                 expected: self.client.chain_id(),
                 actual: trade.chain_id,
             });
         }
-        if trade.amount_in.is_zero()
+        if self.amount_after_fee(trade.amount_in).is_zero()
             || hops.is_empty()
             || trade.recipient.is_zero()
             || trade.recipient == self.address
@@ -90,12 +160,13 @@ impl<P: Provider> FeeRouter<P> {
             currency = hop.currency_out;
         }
         self.check_connection(currency, trade.currency_out)?;
-        let call = abi::swapCall {
+        let call = abi::swapWithFeeCall {
+            expectedFeeBps: U256::from(self.fee_bps),
             request: abi::SwapRequest {
                 tokenIn: address_of(trade.currency_in)?,
                 tokenOut: address_of(trade.currency_out)?,
                 amountIn: trade.amount_in,
-                minimumAmountOut: limits.minimum_amount_out,
+                minimumAmountOut: minimum_amount_out,
                 recipient: trade.recipient,
                 deadline: U256::from(limits.deadline_unix_seconds),
             },
@@ -235,7 +306,7 @@ mod abi {
         #[derive(Default)]
         struct Hop { uint8 version; address tokenIn; address tokenOut; address pool; uint24 fee; PoolKey key; bytes hookData; }
         struct SwapRequest { address tokenIn; address tokenOut; uint256 amountIn; uint256 minimumAmountOut; address recipient; uint256 deadline; }
-        function swap(SwapRequest request, Hop[] hops) external payable returns (uint256 amountOut);
+        function swapWithFee(SwapRequest request, Hop[] hops, uint256 expectedFeeBps) external payable returns (uint256 amountOut);
         function FEE_BPS() external view returns (uint256);
         function feeRecipient() external view returns (address);
         function wrappedNative() external view returns (address);

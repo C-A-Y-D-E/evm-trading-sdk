@@ -1,0 +1,13 @@
+{
+  "name": "evm-trading-sdk-contract-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy:frame": "node scripts/frame.mjs deploy"
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "5.4.0",
+    "@openzeppelin/contracts-upgradeable": "5.4.0",
+    "@openzeppelin/upgrades-core": "1.46.0"
+  }
+}

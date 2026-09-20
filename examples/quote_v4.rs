@@ -2,10 +2,10 @@ use alloy_primitives::{B256, U256, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use evm_trading_sdk::{
-    Dex, EvmClient, ResolvePool,
-    dex::{Currency, ExactInput, QuoteRequest, SwapLimits},
+    Dex, EvmClient, FeeRouter, ResolvePool, RouteHop,
+    dex::{Currency, ExactInput, Quote, QuoteRequest, SwapLimits},
     uniswap::{
-        UniswapDeployment,
+        UniswapDeployment, UniswapPool,
         v4::{UniswapV4, V4PoolLookup, V4QuoteOptions},
     },
 };
@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .ok_or("missing block")?
         .header;
+    let router = FeeRouter::connect(client.clone(), header.hash).await?;
     let adapter = UniswapV4::connect(
         client,
         deployment.v4.ok_or("V4 not configured")?,
@@ -77,18 +78,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Token0 {}, token1 {}, fee {}, tick spacing {}, hook {}",
         key.currency0, key.currency1, key.fee, key.tick_spacing, key.hooks
     );
+    let hop = RouteHop {
+        pool: UniswapPool::V4(pool.clone()),
+        currency_in: trade.currency_in,
+        currency_out: trade.currency_out,
+        hook_data: Default::default(),
+    };
+    let mut quote_trade = trade.clone();
+    quote_trade.amount_in = router.amount_after_fee(trade.amount_in);
     let quote = adapter
         .quote(QuoteRequest {
             pool,
-            trade,
+            trade: quote_trade,
             block_hash: header.hash,
             options: V4QuoteOptions::default(),
         })
         .await?;
-    let plan = adapter.build_swap(
-        &quote,
+    let route_quote = Quote {
+        request: QuoteRequest {
+            pool: vec![hop],
+            trade,
+            block_hash: header.hash,
+            options: (),
+        },
+        amount_out: quote.amount_out,
+    };
+    let plan = router.build_swap(
+        &route_quote,
         SwapLimits {
-            minimum_amount_out: quote.amount_out * U256::from(99) / U256::from(100),
+            slippage_bps: 100,
             deadline_unix_seconds: header.timestamp + 300,
         },
     )?;
@@ -99,19 +117,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quote.request.pool.key.id()
     );
     println!(
-        "{} token0 base units -> {} token1 base units",
-        amount_in, quote.amount_out
+        "{} token0 base units ({} bps input fee) -> {} token1 base units",
+        amount_in,
+        router.fee_bps(),
+        quote.amount_out
     );
     println!(
         "Unsigned swap to {:?}, {} calldata bytes",
         plan.transaction.to,
         plan.transaction.input.input().map_or(0, |data| data.len())
     );
-    if plan.token_approval.is_some() {
-        println!("Requires ERC-20 approval to Permit2 and Permit2 allowance to Universal Router.");
+    if let Some(approval) = plan.approval {
+        println!(
+            "Requires ERC-20 approval to {} for {} base units.",
+            approval.spender, approval.amount
+        );
     }
-    println!(
-        "No transaction sent; this direct Universal Router plan does not use FeeRouter or charge its 1% fee."
-    );
+    println!("No transaction sent; this plan executes through our deployed FeeRouter.");
     Ok(())
 }

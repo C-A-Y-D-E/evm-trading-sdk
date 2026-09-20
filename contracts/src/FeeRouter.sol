@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
 struct PoolKey {
     address currency0;
     address currency1;
@@ -70,7 +74,7 @@ interface IPoolManager {
 }
 
 /// Executes caller-selected canonical V2/V3 and compatible V4 hops; quotes and discovery stay off-chain.
-contract FeeRouter {
+contract FeeRouter is Ownable2Step {
     enum Version {
         V2,
         V3,
@@ -96,22 +100,23 @@ contract FeeRouter {
         uint256 deadline;
     }
 
-    uint256 public constant FEE_BPS = 100;
+    uint256 private constant DEFAULT_FEE_BPS = 100;
     uint256 private constant BPS = 10_000;
     uint160 private constant MIN_SQRT_PRICE = 4295128740;
     uint160 private constant MAX_SQRT_PRICE = 1461446703485210103287273052203988822378723970341;
     bytes32 private constant V2_INIT_CODE_HASH = 0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f;
     bytes32 private constant V3_INIT_CODE_HASH = 0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54;
 
-    address public immutable feeRecipient;
-    address public immutable wrappedNative;
-    IV2Router public immutable v2Router;
-    IV3Router public immutable v3Router;
-    address public immutable v2Factory;
-    address public immutable v3Factory;
-    IPoolManager public immutable poolManager;
-    uint256 private entered = 1;
+    address public feeRecipient;
+    address public wrappedNative;
+    IV2Router public v2Router;
+    IV3Router public v3Router;
+    address public v2Factory;
+    address public v3Factory;
+    IPoolManager public poolManager;
+    uint256 private entered;
     bytes32 private pendingUnlock;
+    uint256 private feeBps = DEFAULT_FEE_BPS;
 
     error InvalidConfiguration();
     error InvalidRoute();
@@ -122,7 +127,13 @@ contract FeeRouter {
     error TokenCallFailed(address token);
     error UnexpectedBalance(address token);
     error UnauthorizedCallback();
+    error UnauthorizedRescue();
     error ReentrantCall();
+    error InvalidFeeBps(uint256 feeBps);
+    error FeeChanged(uint256 expected, uint256 actual);
+
+    event FeeUpdated(uint256 previousFeeBps, uint256 newFeeBps);
+    event FundsRescued(address indexed token, address indexed recipient, uint256 amount);
 
     event SwapExecuted(
         address indexed sender,
@@ -135,12 +146,13 @@ contract FeeRouter {
     );
 
     constructor(
+        address initialOwner,
         address feeRecipient_,
         address wrappedNative_,
         address v2Router_,
         address v3Router_,
         address poolManager_
-    ) {
+    ) Ownable(initialOwner) {
         if (
             feeRecipient_ == address(0) || feeRecipient_ == address(this) || wrappedNative_.code.length == 0
                 || v2Router_.code.length == 0 || v3Router_.code.length == 0 || poolManager_.code.length == 0
@@ -154,6 +166,18 @@ contract FeeRouter {
         v2Factory = v2Router.factory();
         v3Factory = v3Router.factory();
         if (v2Factory.code.length == 0 || v3Factory.code.length == 0) revert InvalidConfiguration();
+        entered = 1;
+    }
+
+    function FEE_BPS() public view returns (uint256) {
+        return feeBps;
+    }
+
+    function setFeeBps(uint256 newFeeBps) external onlyOwner nonReentrant {
+        if (newFeeBps > BPS) revert InvalidFeeBps(newFeeBps);
+        uint256 previousFeeBps = FEE_BPS();
+        feeBps = newFeeBps;
+        emit FeeUpdated(previousFeeBps, newFeeBps);
     }
 
     receive() external payable {
@@ -167,7 +191,15 @@ contract FeeRouter {
         entered = 1;
     }
 
-    /// The fee is floor(gross input / 100), even if a price boundary leaves some input unspent.
+    /// Only the configured fee recipient can recover funds, to itself, outside an active swap or recovery.
+    function rescue(address token, uint256 amount) external nonReentrant {
+        if (msg.sender != feeRecipient) revert UnauthorizedRescue();
+        if (amount == 0 || amount > _balance(token)) revert InvalidAmount();
+        _pay(token, feeRecipient, amount);
+        emit FundsRescued(token, feeRecipient, amount);
+    }
+
+    /// The fee uses gross input, even if a price boundary leaves some input unspent.
     /// Only standard, balance-preserving tokens are supported; no transfer-tax or rebase accounting.
     function swap(SwapRequest calldata request, Hop[] calldata hops)
         external
@@ -175,14 +207,30 @@ contract FeeRouter {
         nonReentrant
         returns (uint256 amountOut)
     {
+        return _swap(request, hops);
+    }
+
+    function swapWithFee(SwapRequest calldata request, Hop[] calldata hops, uint256 expectedFeeBps)
+        external
+        payable
+        nonReentrant
+        returns (uint256 amountOut)
+    {
+        uint256 actualFeeBps = FEE_BPS();
+        if (expectedFeeBps != actualFeeBps) revert FeeChanged(expectedFeeBps, actualFeeBps);
+        return _swap(request, hops);
+    }
+
+    function _swap(SwapRequest calldata request, Hop[] calldata hops) private returns (uint256 amountOut) {
         if (block.timestamp > request.deadline) revert Expired();
         if (hops.length == 0 || request.recipient == address(0) || request.recipient == address(this)) {
             revert InvalidRoute();
         }
         if (request.amountIn == 0) revert InvalidAmount();
-        _collectInput(request.tokenIn, request.amountIn);
-        uint256 fee = request.amountIn / (BPS / FEE_BPS);
+        uint256 fee = Math.mulDiv(request.amountIn, FEE_BPS(), BPS);
         uint256 amount = request.amountIn - fee;
+        if (amount == 0) revert InvalidAmount();
+        _collectInput(request.tokenIn, request.amountIn);
         address currency = request.tokenIn;
         for (uint256 i; i < hops.length; ++i) {
             _convert(currency, hops[i].tokenIn, amount);

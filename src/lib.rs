@@ -1,13 +1,19 @@
 pub mod dex;
+pub mod execution;
 pub mod fee_router;
 pub mod uniswap;
 
 use alloy_provider::{Provider, transport::TransportError};
 use alloy_rpc_types_eth::{BlockId, TransactionRequest};
 use alloy_sol_types::{SolCall, sol};
+use futures_util::try_join;
 
 pub use alloy_primitives::{Address, B256, Bytes, U256};
 pub use dex::{Dex, DiscoverPools, Error, ResolvePool, Result};
+pub use fee_router::{
+    BuyWith, FeeRouter, FundingQuoteFailure, FundingReport, PairSwap, PreparedSwap, RouteHop,
+    TradeSide, Trader,
+};
 
 use dex::{Currency, Token};
 
@@ -46,16 +52,13 @@ impl<P: Provider> EvmClient<P> {
     /// Missing or malformed metadata stays optional; RPC failures remain errors.
     pub async fn token_info(&self, address: Address, block: B256) -> Result<Token> {
         self.require_contract(address, block).await?;
-        let name = self
-            .metadata_text(address, Erc20::nameCall {}, block)
-            .await?;
-        let symbol = self
-            .metadata_text(address, Erc20::symbolCall {}, block)
-            .await?;
-        let decimals = self
-            .optional_call(address, Erc20::decimalsCall {}, block)
-            .await?
-            .and_then(|data| Erc20::decimalsCall::abi_decode_returns_validate(&data).ok());
+        let (name, symbol, decimals) = try_join!(
+            self.metadata_text(address, Erc20::nameCall {}, block),
+            self.metadata_text(address, Erc20::symbolCall {}, block),
+            self.optional_call(address, Erc20::decimalsCall {}, block),
+        )?;
+        let decimals =
+            decimals.and_then(|data| Erc20::decimalsCall::abi_decode_returns_validate(&data).ok());
         Ok(Token {
             chain_id: self.chain_id,
             address,

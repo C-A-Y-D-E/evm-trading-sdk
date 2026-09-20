@@ -2,6 +2,7 @@ use alloy_primitives::{Address, B256, Bytes, U256, b256, keccak256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
+use futures_util::try_join;
 
 use crate::{
     EvmClient,
@@ -46,18 +47,14 @@ impl<P: Provider> UniswapV2<P> {
         deployment: V2Deployment,
         block_hash: B256,
     ) -> Result<Self> {
-        client
-            .require_contract(deployment.factory, block_hash)
-            .await?;
-        let factory = client
-            .call(deployment.router_02, abi::factoryCall {}, block_hash)
-            .await?;
+        let (_, factory, wrapped_native) = try_join!(
+            client.require_contract(deployment.factory, block_hash),
+            client.call(deployment.router_02, abi::factoryCall {}, block_hash),
+            client.call(deployment.router_02, abi::WETHCall {}, block_hash),
+        )?;
         if factory != deployment.factory {
             return Err(Error::UnsupportedDeployment(factory));
         }
-        let wrapped_native = client
-            .call(deployment.router_02, abi::WETHCall {}, block_hash)
-            .await?;
         client.require_contract(wrapped_native, block_hash).await?;
         Ok(Self {
             client,
@@ -155,13 +152,19 @@ impl<P: Provider> UniswapV2<P> {
         Ok(vec![self.load_pool(address, block_hash).await?])
     }
 
-    fn swap_calldata(&self, trade: &ExactInput, path: [Address; 2], limits: SwapLimits) -> Bytes {
+    fn swap_calldata(
+        &self,
+        quote: &Quote<V2Pool>,
+        path: [Address; 2],
+        limits: SwapLimits,
+    ) -> Result<Bytes> {
+        let trade = &quote.request.trade;
         let path = path.to_vec();
-        let minimum_amount_out = limits.minimum_amount_out;
+        let minimum_amount_out = limits.minimum_amount_out(quote.amount_out)?;
         let to = trade.recipient;
         let deadline = U256::from(limits.deadline_unix_seconds);
         let amount_in = trade.amount_in;
-        match (trade.currency_in, trade.currency_out) {
+        Ok(match (trade.currency_in, trade.currency_out) {
             (Currency::Native, _) => abi::swapExactETHForTokensCall {
                 amountOutMin: minimum_amount_out,
                 path,
@@ -188,7 +191,7 @@ impl<P: Provider> UniswapV2<P> {
             }
             .abi_encode()
             .into(),
-        }
+        })
     }
 }
 
@@ -202,21 +205,14 @@ impl<P: Provider> Dex for UniswapV2<P> {
         if address.is_zero() {
             return Err(Error::PoolNotFound);
         }
-        let factory = self
-            .client
-            .call(address, abi::factoryCall {}, block_hash)
-            .await?;
+        let (factory, token0, token1) = try_join!(
+            self.client.call(address, abi::factoryCall {}, block_hash),
+            self.client.call(address, abi::token0Call {}, block_hash),
+            self.client.call(address, abi::token1Call {}, block_hash),
+        )?;
         if factory != self.deployment.factory {
             return Err(Error::UnsupportedDeployment(factory));
         }
-        let token0 = self
-            .client
-            .call(address, abi::token0Call {}, block_hash)
-            .await?;
-        let token1 = self
-            .client
-            .call(address, abi::token1Call {}, block_hash)
-            .await?;
         if token0.is_zero() || token0 >= token1 {
             return Err(Error::InvalidPool(
                 "tokens are not a valid ordered pair".into(),
@@ -312,7 +308,7 @@ impl<P: Provider> Dex for UniswapV2<P> {
                 } else {
                     U256::ZERO
                 }),
-                input: self.swap_calldata(trade, path, limits).into(),
+                input: self.swap_calldata(quote, path, limits)?.into(),
                 ..Default::default()
             },
             approval,

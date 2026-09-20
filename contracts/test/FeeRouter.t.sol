@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {FeeRouter, PoolKey, IERC20, IV3Router, IPoolManager} from "../src/FeeRouter.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 interface Vm {
     function deal(address account, uint256 balance) external;
@@ -9,6 +10,11 @@ interface Vm {
     function expectRevert(bytes calldata data) external;
     function expectRevert() external;
     function warp(uint256 timestamp) external;
+    function prank(address sender) external;
+    function expectEmit(bool topic1, bool topic2, bool topic3, bool data, address emitter) external;
+    function mockCall(address callee, bytes calldata data, bytes calldata result) external;
+    function mockCallRevert(address callee, bytes calldata data, bytes calldata reason) external;
+    function clearMockedCalls() external;
 }
 
 contract MockToken {
@@ -177,12 +183,53 @@ contract ReenteringRecipient {
         FeeRouter.Hop[] memory hops = new FeeRouter.Hop[](0);
         FeeRouter.SwapRequest memory request;
         (bool success, bytes memory reason) = address(router).call(abi.encodeCall(FeeRouter.swap, (request, hops)));
-        blocked = !success && bytes4(reason) == FeeRouter.ReentrantCall.selector;
+        blocked = !success && keccak256(reason) == keccak256(abi.encodeWithSelector(FeeRouter.ReentrantCall.selector));
         require(blocked);
     }
 }
 
+contract NoReturnToken {
+    mapping(address => uint256) public balanceOf;
+
+    constructor(address holder, uint256 amount) {
+        balanceOf[holder] = amount;
+    }
+
+    function transfer(address to, uint256 amount) external {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+    }
+}
+
+contract ReenteringFeeRecipient {
+    bool public rescueBlocked;
+    bool public swapBlocked;
+    bool public feeChangeBlocked;
+
+    receive() external payable {
+        FeeRouter router = FeeRouter(payable(msg.sender));
+        (bool success, bytes memory reason) = address(router).call(abi.encodeCall(FeeRouter.rescue, (address(0), 1)));
+        rescueBlocked =
+            !success && keccak256(reason) == keccak256(abi.encodeWithSelector(FeeRouter.ReentrantCall.selector));
+        FeeRouter.Hop[] memory hops = new FeeRouter.Hop[](0);
+        FeeRouter.SwapRequest memory request;
+        (success, reason) = address(router).call(abi.encodeCall(FeeRouter.swap, (request, hops)));
+        swapBlocked =
+            !success && keccak256(reason) == keccak256(abi.encodeWithSelector(FeeRouter.ReentrantCall.selector));
+        require(rescueBlocked && swapBlocked, "shared reentrancy lock");
+        if (router.owner() == address(this)) {
+            (success, reason) = address(router).call(abi.encodeCall(FeeRouter.setFeeBps, (200)));
+            feeChangeBlocked =
+                !success && keccak256(reason) == keccak256(abi.encodeWithSelector(FeeRouter.ReentrantCall.selector));
+            require(feeChangeBlocked, "fee change during callback");
+        }
+    }
+}
+
 contract FeeRouterTest {
+    event FeeUpdated(uint256 previousFeeBps, uint256 newFeeBps);
+    event FundsRescued(address indexed token, address indexed recipient, uint256 amount);
+
     Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
     address constant FEE_RECIPIENT = address(0xf33);
     address constant RECIPIENT = address(0xbeef);
@@ -201,7 +248,7 @@ contract FeeRouterTest {
         factory = new MockFactory();
         dex = new MockDex(address(factory), address(weth));
         manager = new MockManager();
-        router = new FeeRouter(FEE_RECIPIENT, address(weth), address(dex), address(dex), address(manager));
+        router = _deployRouter(FEE_RECIPIENT);
         weth.mint(address(this), 1 ether);
         weth.approve(address(router), type(uint256).max);
         vm.deal(address(this), 10 ether);
@@ -351,6 +398,226 @@ contract FeeRouterTest {
             weth.balanceOf(address(router)) == dust && middle.balanceOf(address(router)) == dust
                 && output.balanceOf(address(router)) == dust
         );
+    }
+
+    function testOnlyFeeRecipientCanRescueTokensOrEth() public {
+        weth.mint(address(router), 100);
+        vm.deal(address(router), 100);
+        vm.expectRevert(FeeRouter.UnauthorizedRescue.selector);
+        router.rescue(address(weth), 100);
+        vm.expectRevert(FeeRouter.UnauthorizedRescue.selector);
+        router.rescue(address(0), 100);
+        require(weth.balanceOf(address(router)) == 100 && address(router).balance == 100);
+    }
+
+    function testFuzzRescuePaysOnlyTheRequestedTokens(uint96 rawAmount, uint96 remainder) public {
+        uint256 amount = uint256(rawAmount) + 1;
+        weth.mint(address(router), amount + remainder);
+        middle.mint(address(router), 123);
+        vm.expectEmit(true, true, false, true, address(router));
+        emit FundsRescued(address(weth), FEE_RECIPIENT, amount);
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(weth), amount);
+        require(weth.balanceOf(FEE_RECIPIENT) == amount);
+        require(weth.balanceOf(address(router)) == remainder && middle.balanceOf(address(router)) == 123);
+    }
+
+    function testRescuePaysForcedEthAndCanRunAgain() public {
+        vm.deal(address(router), 1 ether);
+        vm.expectEmit(true, true, false, true, address(router));
+        emit FundsRescued(address(0), FEE_RECIPIENT, 0.4 ether);
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(0), 0.4 ether);
+        require(FEE_RECIPIENT.balance == 0.4 ether && address(router).balance == 0.6 ether);
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(0), 0.6 ether);
+        require(FEE_RECIPIENT.balance == 1 ether && address(router).balance == 0);
+    }
+
+    function testRescueRejectsZeroAndExcessiveAmounts() public {
+        weth.mint(address(router), 10);
+        vm.deal(address(router), 10);
+        vm.expectRevert(FeeRouter.InvalidAmount.selector);
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(weth), 0);
+        vm.expectRevert(FeeRouter.InvalidAmount.selector);
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(weth), 11);
+        vm.expectRevert(FeeRouter.InvalidAmount.selector);
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(0), 11);
+        require(weth.balanceOf(address(router)) == 10 && address(router).balance == 10);
+    }
+
+    function testRescueAcceptsTokensWithoutReturnValues() public {
+        NoReturnToken token = new NoReturnToken(address(router), 100);
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(token), 100);
+        require(token.balanceOf(FEE_RECIPIENT) == 100 && token.balanceOf(address(router)) == 0);
+    }
+
+    function testRejectedTokenRecoveryKeepsFundsAndAllowsRetry() public {
+        weth.mint(address(router), 100);
+        bytes memory transfer = abi.encodeCall(IERC20.transfer, (FEE_RECIPIENT, 100));
+        vm.mockCall(address(weth), transfer, abi.encode(false));
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.TokenCallFailed.selector, address(weth)));
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(weth), 100);
+        require(weth.balanceOf(address(router)) == 100 && weth.balanceOf(FEE_RECIPIENT) == 0);
+        vm.clearMockedCalls();
+        vm.mockCallRevert(address(weth), transfer, hex"12345678");
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.TokenCallFailed.selector, address(weth)));
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(weth), 100);
+        vm.clearMockedCalls();
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(weth), 100);
+        require(weth.balanceOf(address(router)) == 0 && weth.balanceOf(FEE_RECIPIENT) == 100);
+    }
+
+    function testRejectedEthRecoveryKeepsTheBalance() public {
+        FeeRouter recoveryRouter = _deployRouter(address(output));
+        vm.deal(address(recoveryRouter), 100);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.TokenCallFailed.selector, address(0)));
+        vm.prank(address(output));
+        recoveryRouter.rescue(address(0), 100);
+        require(address(recoveryRouter).balance == 100 && address(output).balance == 0);
+    }
+
+    function testFeeRecipientCannotReenterDuringRescue() public {
+        ReenteringFeeRecipient recipient = new ReenteringFeeRecipient();
+        FeeRouter recoveryRouter = _deployRouter(address(recipient));
+        vm.deal(address(recoveryRouter), 100);
+        vm.prank(address(recipient));
+        recoveryRouter.rescue(address(0), 40);
+        require(recipient.rescueBlocked() && recipient.swapBlocked());
+        require(address(recoveryRouter).balance == 60 && address(recipient).balance == 40);
+    }
+
+    function testFeeRecipientCannotRescueDuringSwap() public {
+        ReenteringFeeRecipient recipient = new ReenteringFeeRecipient();
+        FeeRouter recoveryRouter = _deployRouter(address(recipient));
+        recoveryRouter.transferOwnership(address(recipient));
+        vm.prank(address(recipient));
+        recoveryRouter.acceptOwnership();
+        vm.deal(address(recoveryRouter), 123);
+        FeeRouter.SwapRequest memory request = _request(10000, 39600);
+        request.tokenIn = address(0);
+        recoveryRouter.swap{value: 10000}(request, _route());
+        require(recipient.rescueBlocked() && recipient.swapBlocked() && recipient.feeChangeBlocked());
+        require(address(recoveryRouter).balance == 123 && address(recipient).balance == 100);
+        require(output.balanceOf(RECIPIENT) == 39600);
+    }
+
+    function testConstructorSetsConfigurationAndDefaultFee() public {
+        weth.mint(address(router), 123);
+        vm.deal(address(router), 456);
+        require(router.FEE_BPS() == 100);
+        require(router.owner() == address(this) && router.feeRecipient() == FEE_RECIPIENT);
+        require(router.wrappedNative() == address(weth) && address(router.poolManager()) == address(manager));
+        require(address(router.v2Router()) == address(dex) && address(router.v3Router()) == address(dex));
+        require(router.v2Factory() == address(factory) && router.v3Factory() == address(factory));
+        require(router.swap(_request(10000, 39600), _route()) == 39600);
+        require(weth.balanceOf(address(router)) == 123 && address(router).balance == 456);
+        vm.prank(FEE_RECIPIENT);
+        router.rescue(address(weth), 123);
+        require(weth.balanceOf(FEE_RECIPIENT) == 223);
+    }
+
+    function testConstructorRejectsInvalidConfiguration() public {
+        vm.expectRevert(FeeRouter.InvalidConfiguration.selector);
+        _deployRouter(address(0));
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
+        new FeeRouter(address(0), FEE_RECIPIENT, address(weth), address(dex), address(dex), address(manager));
+        vm.expectRevert(FeeRouter.InvalidConfiguration.selector);
+        new FeeRouter(address(this), FEE_RECIPIENT, address(output), address(dex), address(dex), address(manager));
+    }
+
+    function testOwnershipRequiresAcceptance() public {
+        router.transferOwnership(RECIPIENT);
+        require(router.owner() == address(this) && router.pendingOwner() == RECIPIENT);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, FEE_RECIPIENT));
+        vm.prank(FEE_RECIPIENT);
+        router.acceptOwnership();
+        vm.prank(RECIPIENT);
+        router.acceptOwnership();
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        router.setFeeBps(200);
+        vm.prank(RECIPIENT);
+        router.setFeeBps(200);
+        require(router.owner() == RECIPIENT && router.FEE_BPS() == 200);
+    }
+
+    function testOwnerCannotChangeFeeDuringRecovery() public {
+        ReenteringFeeRecipient recipient = new ReenteringFeeRecipient();
+        FeeRouter recoveryRouter = _deployRouter(address(recipient));
+        recoveryRouter.transferOwnership(address(recipient));
+        vm.prank(address(recipient));
+        recoveryRouter.acceptOwnership();
+        vm.deal(address(recoveryRouter), 100);
+        vm.prank(address(recipient));
+        recoveryRouter.rescue(address(0), 40);
+        require(recipient.feeChangeBlocked() && address(recoveryRouter).balance == 60);
+    }
+
+    function testOnlyOwnerCanSetTheFee() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, FEE_RECIPIENT));
+        vm.prank(FEE_RECIPIENT);
+        router.setFeeBps(200);
+        require(router.FEE_BPS() == 100);
+        vm.expectEmit(false, false, false, true, address(router));
+        emit FeeUpdated(100, 333);
+        router.setFeeBps(333);
+        require(router.FEE_BPS() == 333);
+    }
+
+    function testZeroFeeRoutesTheWholeInput() public {
+        router.setFeeBps(0);
+        require(router.FEE_BPS() == 0);
+        require(router.swapWithFee(_request(10000, 40000), _route(), 0) == 40000);
+        require(weth.balanceOf(FEE_RECIPIENT) == 0);
+    }
+
+    function testFeeChangeRejectsAnOldQuoteBeforeTakingInput() public {
+        router.setFeeBps(200);
+        FeeRouter.Hop[] memory hops = _route();
+        uint256 beforeBalance = weth.balanceOf(address(this));
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.FeeChanged.selector, 100, 200));
+        router.swapWithFee(_request(10000, 1), hops, 100);
+        require(weth.balanceOf(address(this)) == beforeBalance && weth.balanceOf(FEE_RECIPIENT) == 0);
+        require(router.swapWithFee(_request(10000, 39200), _route(), 200) == 39200);
+    }
+
+    function testFeeBoundsAndFullInputFee() public {
+        FeeRouter.Hop[] memory hops = _route();
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.InvalidFeeBps.selector, 10001));
+        router.setFeeBps(10001);
+        router.setFeeBps(10000);
+        uint256 beforeBalance = weth.balanceOf(address(this));
+        vm.expectRevert(FeeRouter.InvalidAmount.selector);
+        router.swapWithFee(_request(10000, 1), hops, 10000);
+        require(weth.balanceOf(address(this)) == beforeBalance);
+    }
+
+    function testNativeSwapsUseTheConfiguredFee() public {
+        router.setFeeBps(333);
+        FeeRouter.SwapRequest memory request = _request(10001, 38672);
+        request.tokenIn = address(0);
+        require(router.swapWithFee{value: 10001}(request, _route(), 333) == 38672);
+        require(FEE_RECIPIENT.balance == 333);
+    }
+
+    function testFuzzConfiguredFeesRoundDownOnce(uint96 rawAmount, uint16 rawFee) public {
+        uint256 amount = uint256(rawAmount) % 1e17 + 1;
+        uint256 feeBps = uint256(rawFee) % 10000;
+        uint256 fee = amount * feeBps / 10000;
+        router.setFeeBps(feeBps);
+        require(router.swapWithFee(_request(amount, 1), _route(), feeBps) == (amount - fee) * 4);
+        require(weth.balanceOf(FEE_RECIPIENT) == fee);
+    }
+
+    function _deployRouter(address feeRecipient) private returns (FeeRouter) {
+        return new FeeRouter(address(this), feeRecipient, address(weth), address(dex), address(dex), address(manager));
     }
 
     function _route() private view returns (FeeRouter.Hop[] memory hops) {

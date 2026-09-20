@@ -64,10 +64,20 @@ async fn token_swap_preserves_the_quote_limits_and_approval_target() {
     assert_eq!(plan.transaction.to, Some(ROUTER.into()));
     assert_eq!(plan.transaction.chain_id, Some(ROBINHOOD_CHAIN_ID));
     assert_eq!(call.amountIn, U256::from(1_000));
-    assert_eq!(call.amountOutMin, U256::from(850));
+    assert_eq!(call.amountOutMin, U256::from(855));
     assert_eq!(call.path, vec![WETH, TOKEN]);
     assert_eq!(call.to, RECIPIENT);
     assert_eq!(call.deadline, U256::from(2_000_000_000u64));
+    assert!(matches!(
+        adapter.build_swap(
+            &quote,
+            SwapLimits {
+                slippage_bps: 10001,
+                ..limits()
+            }
+        ),
+        Err(Error::InvalidTrade(_))
+    ));
     let approval = plan.approval.unwrap();
     assert_eq!(
         (
@@ -92,7 +102,7 @@ async fn native_buy_attaches_value_without_token_approval() {
     assert_eq!(plan.transaction.value, Some(U256::from(1_000)));
     assert!(plan.approval.is_none());
     assert_eq!(call.path, vec![WETH, TOKEN]);
-    assert_eq!(call.amountOutMin, U256::from(850));
+    assert_eq!(call.amountOutMin, U256::from(855));
     assert_eq!(call.to, RECIPIENT);
     assert_eq!(call.deadline, U256::from(2_000_000_000u64));
 }
@@ -108,7 +118,7 @@ async fn native_sell_uses_the_reverse_pool_direction() {
 
     assert_eq!(call.path, vec![TOKEN, WETH]);
     assert_eq!(call.amountIn, U256::from(1_000));
-    assert_eq!(call.amountOutMin, U256::from(850));
+    assert_eq!(call.amountOutMin, U256::from(855));
     assert_eq!(call.to, RECIPIENT);
     assert_eq!(plan.transaction.value.unwrap_or_default(), U256::ZERO);
     assert_eq!(plan.approval.unwrap().token, TOKEN);
@@ -328,7 +338,7 @@ async fn quote(
 
 fn limits() -> SwapLimits {
     SwapLimits {
-        minimum_amount_out: U256::from(850),
+        slippage_bps: 500,
         deadline_unix_seconds: 2_000_000_000,
     }
 }

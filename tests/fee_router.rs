@@ -470,6 +470,7 @@ async fn sells_infer_both_target_positions_and_keep_gross_approvals() {
             (U256::from(2000), U160::from(1), 0u32, U256::from(50000)),
         );
         let request = pair_request(target, side);
+        v3_price(&rpc);
         let prepared = router
             .trader(OWNER)
             .prepare_swap(request, limits())
@@ -509,6 +510,7 @@ async fn native_settlement_changes_endpoints_but_keeps_weth_in_the_hop() {
             &rpc,
             (U256::from(2000), U160::from(1), 0u32, U256::from(50000)),
         );
+        v3_price(&rpc);
         let prepared = router
             .trader(OWNER)
             .with_native_settlement()
@@ -602,6 +604,14 @@ async fn v2_pair_selection_quotes_the_input_after_fees() {
         }
     }
     returned(&rpc, vec![U256::from(9900), U256::from(2000)]);
+    returned(
+        &rpc,
+        (
+            alloy_primitives::aliases::U112::from(100000),
+            alloy_primitives::aliases::U112::from(100000),
+            0u32,
+        ),
+    );
     let prepared = router
         .trader(OWNER)
         .prepare_swap(
@@ -725,6 +735,71 @@ async fn eth_buy_builds_one_funded_v4_transaction_and_keeps_discovery_failures()
 }
 
 #[tokio::test]
+async fn funded_preview_combines_both_pool_prices_and_fees() {
+    let (router, rpc) = router_with_rpc(100).await.unwrap();
+    let mut request = v4_buy_setup(&rpc);
+    let V4PoolLookup::Key(key) = &mut request.pair else {
+        unreachable!()
+    };
+    key.hooks = Address::ZERO;
+    funding_connection(&rpc);
+    returned(&rpc, Address::ZERO);
+    returned(&rpc, pair_request(NVDA, TradeSide::Buy).pair);
+    v3_pool(&rpc);
+    returned(&rpc, Address::ZERO);
+    returned(&rpc, Address::ZERO);
+    v3_pool(&rpc);
+    returned(
+        &rpc,
+        (U256::from(9000), U160::from(1), 0u32, U256::from(50000)),
+    );
+    returned(&rpc, (U160::from(1), I24::ZERO, U24::ZERO, U24::ZERO));
+    returned(&rpc, (U256::from(8905), U256::from(50000)));
+    v3_price(&rpc);
+    returned(&rpc, (U160::from(1) << 96, I24::ZERO, U24::ZERO, U24::ZERO));
+
+    let prepared = router
+        .trader(OWNER)
+        .prepare_v4_swap(request, V4QuoteOptions::default(), limits())
+        .await
+        .unwrap();
+    let impact = prepared.price_impact.as_ref().unwrap();
+    assert_eq!(impact.market_amount_out, U256::from(10000));
+    assert_eq!(impact.market_amount_out_after_fees, U256::from(9895));
+    assert_eq!(impact.price_impact_bps, 1000);
+    assert_eq!(impact.total_cost_bps, 1095);
+    assert_eq!(impact.pool_fee_pips, [500, 0]);
+    assert_eq!(prepared.quote.request.pool.len(), 2);
+    assert_eq!(prepared.router_fee_amount, U256::from(100));
+    assert_eq!(prepared.minimum_amount_out(), U256::from(8815));
+    assert!(rpc.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn missing_price_state_keeps_the_output_quote_and_reason() {
+    let (router, rpc) = router_with_rpc(100).await.unwrap();
+    v3_connection(&rpc);
+    v3_pool(&rpc);
+    v3_pool(&rpc);
+    returned(
+        &rpc,
+        (U256::from(2000), U160::from(1), 0u32, U256::from(50000)),
+    );
+    rpc.push_failure_msg("slot0 unavailable");
+    let prepared = router
+        .trader(OWNER)
+        .prepare_swap(pair_request(NVDA, TradeSide::Buy), limits())
+        .await
+        .unwrap();
+    assert!(matches!(
+        prepared.price_impact,
+        Err(evm_trading_sdk::PriceImpactUnavailable::State(_))
+    ));
+    assert_eq!(prepared.quote.amount_out, U256::from(2000));
+    assert!(rpc.read_q().is_empty());
+}
+
+#[tokio::test]
 async fn eth_buy_without_a_funding_route_returns_the_search_report() {
     let (router, rpc) = router_with_rpc(100).await.unwrap();
     let request = v4_buy_setup(&rpc);
@@ -800,6 +875,7 @@ async fn native_buy_uses_a_direct_weth_pair_without_changing_sell_input() {
             &rpc,
             (U256::from(2000), U160::from(1), 0u32, U256::from(50000)),
         );
+        v3_price(&rpc);
         let prepared = router
             .trader(OWNER)
             .buy_with(BuyWith::Native)
@@ -832,6 +908,7 @@ async fn buy_currency_does_not_restrict_sell_input() {
             &rpc,
             (U256::from(2000), U160::from(1), 0u32, U256::from(50000)),
         );
+        v3_price(&rpc);
         let prepared = router
             .trader(OWNER)
             .with_native_settlement()
@@ -1018,6 +1095,13 @@ fn v3_pool(rpc: &Asserter) {
 
 fn returned(rpc: &Asserter, value: impl SolValue) {
     rpc.push_success(&Bytes::from(value.abi_encode()));
+}
+
+fn v3_price(rpc: &Asserter) {
+    returned(
+        rpc,
+        (U160::from(1) << 96, I24::ZERO, 0u16, 0u16, 0u16, 0u16, true),
+    );
 }
 
 fn code(rpc: &Asserter) {

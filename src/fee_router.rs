@@ -4,7 +4,9 @@ use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
 use futures_util::try_join;
 
+mod price_impact;
 mod trader;
+pub use price_impact::{PriceImpact, PriceImpactUnavailable};
 pub use trader::{
     BuyWith, FundingQuoteFailure, FundingReport, PairSwap, PreparedSwap, TradeSide, Trader,
 };

@@ -3,7 +3,7 @@ use alloy_provider::Provider;
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_sol_types::sol;
 
-use super::{FeeRouter, RouteHop};
+use super::{FeeRouter, PriceImpact, PriceImpactUnavailable, RouteHop, price_impact};
 use crate::{
     Dex, DiscoverPools, ResolvePool,
     dex::{Currency, Error, ExactInput, Quote, QuoteRequest, Result, SwapLimits, SwapTransaction},
@@ -62,6 +62,21 @@ pub struct PreparedSwap {
     pub quote: Quote<Vec<RouteHop>>,
     pub plan: SwapTransaction,
     pub funding: Option<FundingReport>,
+    pub price_impact: std::result::Result<PriceImpact, PriceImpactUnavailable>,
+    pub router_fee_amount: U256,
+    limits: SwapLimits,
+}
+
+impl PreparedSwap {
+    pub fn limits(&self) -> SwapLimits {
+        self.limits
+    }
+
+    pub fn minimum_amount_out(&self) -> U256 {
+        self.limits
+            .minimum_amount_out(self.quote.amount_out)
+            .expect("validated limits")
+    }
 }
 
 #[derive(Debug)]
@@ -124,13 +139,7 @@ impl<'a, P: Provider> Trader<'a, P> {
         let prepared = self
             .prepare_request(request.clone(), limits)
             .await
-            .map_err(|error| {
-                Error::Execution(Box::new(crate::execution::ExecutionError {
-                    stage: crate::execution::ExecutionStage::Preparation,
-                    failure: crate::execution::ExecutionFailure::Operation(Box::new(error)),
-                    record: ExecutionRecord::default(),
-                }))
-            })?;
+            .map_err(preparation_error)?;
         execution
             .submit(
                 &self.router.client,
@@ -152,6 +161,63 @@ impl<'a, P: Provider> Trader<'a, P> {
         P: Clone,
     {
         let result = self.submit(execution, request, limits).await?;
+        self.wait_for_swap(execution, result).await
+    }
+
+    /// Submits the previewed route and minimum output, without a second route search.
+    /// After approval, requotes the same hops but retains the original calldata and fee guard.
+    pub async fn submit_prepared<S: Provider, J: ExecutionJournal>(
+        &self,
+        execution: &mut Execution<S, J>,
+        prepared: PreparedSwap,
+    ) -> Result<ExecutionResult>
+    where
+        P: Clone,
+    {
+        let limits = prepared.limits;
+        let expected = self
+            .router
+            .build_swap(&prepared.quote, limits)
+            .map_err(preparation_error)?;
+        if prepared.quote.request.trade.sender != self.wallet
+            || prepared.quote.request.trade.recipient != self.wallet
+            || prepared.plan.transaction != expected.transaction
+            || prepared.plan.approval != expected.approval
+        {
+            return Err(preparation_error(Error::InvalidTrade(
+                "prepared swap does not match this wallet and quote".into(),
+            )));
+        }
+        let quote = prepared.quote.clone();
+        let plan = prepared.plan.clone();
+        execution
+            .submit(&self.router.client, prepared, limits, async {
+                let mut refreshed = self.refresh_route(quote, limits).await?;
+                // The displayed minimum is the user's bound, even if the approval changes the quote.
+                refreshed.plan = plan;
+                Ok(refreshed)
+            })
+            .await
+    }
+
+    /// Executes the prepared route, then waits within the confirmation timeout.
+    pub async fn swap_prepared<S: Provider, J: ExecutionJournal>(
+        &self,
+        execution: &mut Execution<S, J>,
+        prepared: PreparedSwap,
+    ) -> Result<ExecutionResult>
+    where
+        P: Clone,
+    {
+        let result = self.submit_prepared(execution, prepared).await?;
+        self.wait_for_swap(execution, result).await
+    }
+
+    async fn wait_for_swap<S: Provider, J: ExecutionJournal>(
+        &self,
+        execution: &mut Execution<S, J>,
+        result: ExecutionResult,
+    ) -> Result<ExecutionResult> {
         if result.status != ExecutionStatus::Pending || result.record.swap_hash().is_none() {
             return Ok(result);
         }
@@ -210,6 +276,117 @@ impl<'a, P: Provider> Trader<'a, P> {
             buy_with: self.buy_with,
         };
         trader.prepare_request(request, limits).await
+    }
+
+    async fn refresh_route(
+        &self,
+        mut quote: Quote<Vec<RouteHop>>,
+        limits: SwapLimits,
+    ) -> Result<PreparedSwap>
+    where
+        P: Clone,
+    {
+        let client = &self.router.client;
+        let block = client
+            .provider()
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(|error| Error::Rpc(Box::new(error)))?
+            .ok_or_else(|| Error::InvalidTrade("latest block was not returned".into()))?
+            .header
+            .hash;
+        let router = FeeRouter::connect(client.clone(), block).await?;
+        if router.fee_bps != self.router.fee_bps {
+            return Err(Error::InvalidTrade(
+                "router fee changed since the preview; prepare again".into(),
+            ));
+        }
+        let minimum = limits.minimum_amount_out(quote.amount_out)?;
+        let deployment = UniswapDeployment::robinhood_mainnet();
+        let mut amount = router.amount_after_fee(quote.request.trade.amount_in);
+        for hop in &quote.request.pool {
+            let trade = ExactInput {
+                currency_in: hop.currency_in,
+                currency_out: hop.currency_out,
+                amount_in: amount,
+                ..quote.request.trade.clone()
+            };
+            amount = match &hop.pool {
+                UniswapPool::V2(pool) => {
+                    let adapter = UniswapV2::connect(
+                        client.clone(),
+                        deployment
+                            .v2
+                            .clone()
+                            .ok_or(self.not_configured("Uniswap V2"))?,
+                        block,
+                    )
+                    .await?;
+                    adapter
+                        .quote(QuoteRequest {
+                            pool: pool.clone(),
+                            trade,
+                            block_hash: block,
+                            options: (),
+                        })
+                        .await?
+                        .amount_out
+                }
+                UniswapPool::V3(pool) => {
+                    let adapter = UniswapV3::connect(
+                        client.clone(),
+                        deployment
+                            .v3
+                            .clone()
+                            .ok_or(self.not_configured("Uniswap V3"))?,
+                        block,
+                    )
+                    .await?;
+                    adapter
+                        .quote(QuoteRequest {
+                            pool: pool.clone(),
+                            trade,
+                            block_hash: block,
+                            options: (),
+                        })
+                        .await?
+                        .amount_out
+                }
+                UniswapPool::V4(pool) => {
+                    let adapter = UniswapV4::connect(
+                        client.clone(),
+                        deployment
+                            .v4
+                            .clone()
+                            .ok_or(self.not_configured("Uniswap V4"))?,
+                        block,
+                    )
+                    .await?;
+                    adapter
+                        .quote(QuoteRequest {
+                            pool: pool.clone(),
+                            trade,
+                            block_hash: block,
+                            options: V4QuoteOptions {
+                                hook_data: hop.hook_data.clone(),
+                            },
+                        })
+                        .await?
+                        .amount_out
+                }
+            };
+        }
+        if amount < minimum {
+            return Err(Error::InvalidTrade(
+                "refreshed output is below the previewed minimum; prepare again".into(),
+            ));
+        }
+        quote.amount_out = amount;
+        quote.request.block_hash = block;
+        router
+            .trader(self.wallet)
+            .finish_preparation(quote, None, limits)
+            .await
     }
 
     /// Resolves a V2/V3 pair and quotes it at the router's configuration block.
@@ -367,12 +544,7 @@ impl<'a, P: Provider> Trader<'a, P> {
             },
             amount_out: pool_quote.amount_out,
         };
-        let plan = self.router.build_swap(&quote, limits)?;
-        Ok(PreparedSwap {
-            quote,
-            plan,
-            funding: None,
-        })
+        self.finish_preparation(quote, None, limits).await
     }
 
     async fn prepare_funded<D: Dex>(
@@ -467,11 +639,33 @@ impl<'a, P: Provider> Trader<'a, P> {
             },
             amount_out,
         };
+        self.finish_preparation(quote, Some(report), limits).await
+    }
+
+    async fn finish_preparation(
+        &self,
+        quote: Quote<Vec<RouteHop>>,
+        funding: Option<FundingReport>,
+        limits: SwapLimits,
+    ) -> Result<PreparedSwap> {
         let plan = self.router.build_swap(&quote, limits)?;
+        let input = quote.request.trade.amount_in;
+        let price_impact = price_impact::estimate(
+            &self.router.client,
+            &quote.request.pool,
+            quote.request.block_hash,
+            input,
+            self.router.amount_after_fee(input),
+            quote.amount_out,
+        )
+        .await;
         Ok(PreparedSwap {
             quote,
             plan,
-            funding: Some(report),
+            funding,
+            price_impact,
+            router_fee_amount: self.router.input_fee(input),
+            limits,
         })
     }
 
@@ -522,6 +716,14 @@ fn pool_currency(address: Address) -> Currency {
     } else {
         Currency::Erc20(address)
     }
+}
+
+fn preparation_error(error: Error) -> Error {
+    Error::Execution(Box::new(crate::execution::ExecutionError {
+        stage: crate::execution::ExecutionStage::Preparation,
+        failure: crate::execution::ExecutionFailure::Operation(Box::new(error)),
+        record: ExecutionRecord::default(),
+    }))
 }
 
 sol! { function factory() external view returns (address); }

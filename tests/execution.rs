@@ -48,6 +48,8 @@ struct Scenario {
     fail_hash_save: bool,
     low_gas_balance: bool,
     invisible_allowance: bool,
+    worse_quote: bool,
+    changed_fee: bool,
 }
 
 #[derive(Default)]
@@ -366,7 +368,13 @@ fn contract_call(tx: &Value, state: &State, scenario: Scenario) -> Result<Value,
         }
     }
     Ok(if selector == signature("FEE_BPS()") {
-        encoded(U256::from(100))
+        encoded(U256::from(if state.approved && scenario.changed_fee {
+            200
+        } else {
+            100
+        }))
+    } else if selector == signature("slot0()") {
+        encoded((U160::from(1) << 96, I24::ZERO, 0u16, 0u16, 0u16, 0u16, true))
     } else if selector == signature("fee()") {
         encoded(U24::from(500))
     } else if selector == signature("tickSpacing()") {
@@ -383,7 +391,11 @@ fn contract_call(tx: &Value, state: &State, scenario: Scenario) -> Result<Value,
         })
     } else if to == deployment.v3.unwrap().quoter_v2 {
         encoded((
-            U256::from(if state.approved { 3000 } else { 2000 }),
+            U256::from(if state.approved {
+                if scenario.worse_quote { 1000 } else { 3000 }
+            } else {
+                2000
+            }),
             U160::from(1),
             0u32,
             U256::from(50000),
@@ -414,6 +426,149 @@ fn execution_error(error: Error) -> Box<evm_trading_sdk::execution::ExecutionErr
         panic!("expected execution context: {error:?}")
     };
     error
+}
+
+#[tokio::test]
+async fn prepared_submission_uses_the_preview_without_requoting() {
+    let rpc = Rpc::new(Scenario::default());
+    let router = rpc.router().await;
+    let trader = router.trader(WALLET);
+    let TradeRequest::Pair(request) = request(TradeSide::Buy) else {
+        unreachable!()
+    };
+    let prepared = trader.prepare_swap(request, limits()).await.unwrap();
+    assert!(prepared.price_impact.is_ok());
+    assert_eq!(prepared.router_fee_amount, U256::from(100));
+    assert_eq!(prepared.minimum_amount_out(), U256::from(1990));
+    let expected = prepared.plan.transaction.input.input().unwrap().clone();
+    {
+        let mut state = rpc.state.lock().unwrap();
+        let slot = Bytes::copy_from_slice(&alloy_primitives::keccak256("slot0()")[..4]);
+        let call = state
+            .calls
+            .iter()
+            .find(|(method, params)| method == "eth_call" && params[0]["input"] == json!(slot))
+            .unwrap();
+        assert_eq!(
+            call.1[1],
+            json!({"blockHash":B256::repeat_byte(7),"requireCanonical":true})
+        );
+        state.calls.clear();
+    }
+    let result = trader
+        .submit_prepared(&mut rpc.execution(), prepared)
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecutionStatus::Pending);
+    let state = rpc.state.lock().unwrap();
+    assert_eq!(state.sent[0]["data"], json!(expected));
+    let quoter = UniswapDeployment::robinhood_mainnet().v3.unwrap().quoter_v2;
+    assert!(
+        !state
+            .calls
+            .iter()
+            .any(|(method, params)| method == "eth_call" && params[0]["to"] == json!(quoter))
+    );
+}
+
+#[tokio::test]
+async fn prepared_swap_keeps_the_displayed_calldata_after_approval() {
+    let rpc = Rpc::new(Scenario::default());
+    let router = rpc.router().await;
+    let trader = router.trader(WALLET);
+    let TradeRequest::Pair(request) = request(TradeSide::Sell) else {
+        unreachable!()
+    };
+    let prepared = trader.prepare_swap(request, limits()).await.unwrap();
+    let expected = prepared.plan.transaction.input.input().unwrap().clone();
+    let result = trader
+        .swap_prepared(&mut rpc.execution(), prepared)
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecutionStatus::Confirmed);
+    let state = rpc.state.lock().unwrap();
+    assert_eq!(state.sent.len(), 2);
+    assert_eq!(state.sent[1]["data"], json!(expected));
+    let call = swapWithFeeCall::abi_decode(&expected).unwrap();
+    assert_eq!(call.request.minimumAmountOut, U256::from(1990));
+    let quote_calls = state
+        .calls
+        .iter()
+        .filter(|(method, params)| {
+            method == "eth_call"
+                && params[0]["to"]
+                    == json!(UniswapDeployment::robinhood_mainnet().v3.unwrap().quoter_v2)
+                && params[0]["input"]
+                    .as_str()
+                    .is_some_and(|input| input.len() > 10)
+        })
+        .count();
+    assert_eq!(quote_calls, 2);
+}
+
+#[tokio::test]
+async fn prepared_swap_stops_when_output_or_fee_changes_beyond_the_preview() {
+    for scenario in [
+        Scenario {
+            worse_quote: true,
+            ..Default::default()
+        },
+        Scenario {
+            changed_fee: true,
+            ..Default::default()
+        },
+    ] {
+        let rpc = Rpc::new(scenario);
+        let router = rpc.router().await;
+        let trader = router.trader(WALLET);
+        let TradeRequest::Pair(request) = request(TradeSide::Sell) else {
+            unreachable!()
+        };
+        let prepared = trader.prepare_swap(request, limits()).await.unwrap();
+        let error = execution_error(
+            trader
+                .submit_prepared(&mut rpc.execution(), prepared)
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error.stage, ExecutionStage::Refresh);
+        assert_eq!(error.record.transactions.len(), 1);
+        assert_eq!(
+            error.record.transactions[0].submission,
+            SubmissionState::Submitted(B256::repeat_byte(1))
+        );
+        assert_eq!(rpc.sends(), 1);
+    }
+}
+
+#[tokio::test]
+async fn prepared_swap_rejects_another_wallet_or_modified_plan() {
+    let rpc = Rpc::new(Scenario::default());
+    let router = rpc.router().await;
+    for modified in [false, true] {
+        let TradeRequest::Pair(request) = request(TradeSide::Buy) else {
+            unreachable!()
+        };
+        let mut prepared = router
+            .trader(WALLET)
+            .prepare_swap(request, limits())
+            .await
+            .unwrap();
+        let wallet = if modified {
+            prepared.plan.transaction.value = Some(U256::from(1));
+            WALLET
+        } else {
+            Address::repeat_byte(5)
+        };
+        assert!(
+            router
+                .trader(wallet)
+                .submit_prepared(&mut rpc.execution(), prepared)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(rpc.sends(), 0);
 }
 
 #[tokio::test]

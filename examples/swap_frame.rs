@@ -187,9 +187,7 @@ async fn main() -> Result<()> {
     } else {
         trader
     };
-    let result = trader
-        .swap(&mut execution, trial.request, trial.limits)
-        .await?;
+    let result = trader.swap_prepared(&mut execution, trial.prepared).await?;
     present(&result)?;
     Ok(())
 }
@@ -227,8 +225,6 @@ async fn check_chain(frame: &impl Provider) -> Result<()> {
 
 struct Trial {
     router: FeeRouter<RootProvider>,
-    request: TradeRequest,
-    limits: SwapLimits,
     prepared: PreparedSwap,
 }
 
@@ -322,12 +318,18 @@ async fn prepare(
         prepared.quote.amount_out,
         options.slippage_bps
     );
-    Ok(Trial {
-        router,
-        request,
-        limits,
-        prepared,
-    })
+    println!(
+        "Minimum output: {} base units",
+        prepared.minimum_amount_out()
+    );
+    match &prepared.price_impact {
+        Ok(impact) => println!(
+            "Estimated route impact excluding fees: {} bps; total cost including fees: {} bps; pool fees per hop: {:?} pips",
+            impact.price_impact_bps, impact.total_cost_bps, impact.pool_fee_pips
+        ),
+        Err(reason) => println!("Price impact unavailable: {reason}"),
+    }
+    Ok(Trial { router, prepared })
 }
 
 async fn resolve_tokens(

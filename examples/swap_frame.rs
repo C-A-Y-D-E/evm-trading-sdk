@@ -507,6 +507,7 @@ fn load_record() -> Result<ExecutionRecord> {
             submission,
             transaction: serde_json::from_value(value["transaction"].clone())?,
             receipt: None,
+            signed_hash: None,
         }],
     })
 }

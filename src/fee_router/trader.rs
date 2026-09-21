@@ -1,3 +1,4 @@
+use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, U256, aliases::U24};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::BlockNumberOrTag;
@@ -8,9 +9,10 @@ use crate::{
     Dex, DiscoverPools, ResolvePool,
     dex::{Currency, Error, ExactInput, Quote, QuoteRequest, Result, SwapLimits, SwapTransaction},
     execution::{
-        Execution, ExecutionJournal, ExecutionRecord, ExecutionResult, ExecutionStatus,
-        TradeRequest,
+        Execution, ExecutionJournal, ExecutionOptions, ExecutionRecord, ExecutionResult,
+        ExecutionStatus, TradeRequest, check_status,
     },
+    submit::Submitter,
     uniswap::{
         DiscoveryOutcome, UniswapDeployment, UniswapPool,
         v2::UniswapV2,
@@ -91,14 +93,168 @@ pub struct FundingQuoteFailure {
     pub error: Error,
 }
 
+/// Shared trading configuration. Signing credentials and journals belong to each operation.
 pub struct Trader<'a, P: Provider> {
+    router: &'a FeeRouter<P>,
+    native_settlement: bool,
+    buy_with: BuyWith,
+    execution_options: ExecutionOptions,
+}
+
+impl<'a, P: Provider + Clone> Trader<'a, P> {
+    pub fn new(router: &'a FeeRouter<P>) -> Self {
+        Self {
+            router,
+            native_settlement: false,
+            buy_with: BuyWith::Native,
+            execution_options: ExecutionOptions::default(),
+        }
+    }
+
+    pub fn with_native_settlement(mut self) -> Self {
+        self.native_settlement = true;
+        self
+    }
+
+    pub fn buy_with(mut self, currency: BuyWith) -> Self {
+        self.buy_with = currency;
+        self
+    }
+
+    pub fn with_execution_options(mut self, options: ExecutionOptions) -> Self {
+        self.execution_options = options;
+        self
+    }
+
+    pub fn for_wallet(&self, wallet: Address) -> WalletTrader<'a, P> {
+        WalletTrader {
+            router: self.router,
+            wallet,
+            native_settlement: self.native_settlement,
+            buy_with: self.buy_with,
+        }
+    }
+
+    pub async fn prepare_swap(
+        &self,
+        wallet: Address,
+        request: PairSwap,
+        limits: SwapLimits,
+    ) -> Result<PreparedSwap> {
+        self.for_wallet(wallet).prepare_swap(request, limits).await
+    }
+
+    pub async fn prepare_v4_swap(
+        &self,
+        wallet: Address,
+        request: PairSwap<V4PoolLookup>,
+        options: V4QuoteOptions,
+        limits: SwapLimits,
+    ) -> Result<PreparedSwap> {
+        self.for_wallet(wallet)
+            .prepare_v4_swap(request, options, limits)
+            .await
+    }
+
+    /// Each call has its own record and journal. Serialize trades spending from the same wallet
+    /// across the service: pending-nonce reads do not reserve nonces for concurrent calls.
+    pub async fn submit<J: ExecutionJournal>(
+        &self,
+        request: TradeRequest,
+        limits: SwapLimits,
+        signer: &EthereumWallet,
+        submitter: &dyn Submitter,
+        journal: &mut J,
+    ) -> Result<ExecutionResult> {
+        self.for_wallet(signer.default_signer().address())
+            .submit(
+                &mut self.execution(signer, submitter, journal),
+                request,
+                limits,
+            )
+            .await
+    }
+
+    pub async fn swap<J: ExecutionJournal>(
+        &self,
+        request: TradeRequest,
+        limits: SwapLimits,
+        signer: &EthereumWallet,
+        submitter: &dyn Submitter,
+        journal: &mut J,
+    ) -> Result<ExecutionResult> {
+        self.for_wallet(signer.default_signer().address())
+            .swap(
+                &mut self.execution(signer, submitter, journal),
+                request,
+                limits,
+            )
+            .await
+    }
+
+    pub async fn submit_prepared<J: ExecutionJournal>(
+        &self,
+        prepared: PreparedSwap,
+        signer: &EthereumWallet,
+        submitter: &dyn Submitter,
+        journal: &mut J,
+    ) -> Result<ExecutionResult> {
+        self.for_wallet(signer.default_signer().address())
+            .submit_prepared(&mut self.execution(signer, submitter, journal), prepared)
+            .await
+    }
+
+    pub async fn swap_prepared<J: ExecutionJournal>(
+        &self,
+        prepared: PreparedSwap,
+        signer: &EthereumWallet,
+        submitter: &dyn Submitter,
+        journal: &mut J,
+    ) -> Result<ExecutionResult> {
+        self.for_wallet(signer.default_signer().address())
+            .swap_prepared(&mut self.execution(signer, submitter, journal), prepared)
+            .await
+    }
+
+    pub async fn status(&self, record: &ExecutionRecord) -> Result<ExecutionResult> {
+        let wallet = record
+            .transactions
+            .first()
+            .and_then(|tx| tx.transaction.from)
+            .unwrap_or_default();
+        check_status(
+            self.router.client.provider(),
+            wallet,
+            self.router.client.chain_id(),
+            record,
+        )
+        .await
+    }
+
+    fn execution<'b, J: ExecutionJournal>(
+        &'b self,
+        signer: &EthereumWallet,
+        submitter: &'b dyn Submitter,
+        journal: &'b mut J,
+    ) -> Execution<'b, &'b P, &'b mut J> {
+        Execution::new(
+            self.router.client.provider(),
+            journal,
+            self.execution_options,
+        )
+        .with_submitter(signer.clone(), submitter)
+    }
+}
+
+/// Wallet-bound convenience for unsigned preparation and wallet RPC integrations such as Frame.
+pub struct WalletTrader<'a, P: Provider> {
     router: &'a FeeRouter<P>,
     wallet: Address,
     native_settlement: bool,
     buy_with: BuyWith,
 }
 
-impl<'a, P: Provider> Trader<'a, P> {
+impl<'a, P: Provider> WalletTrader<'a, P> {
     pub(super) fn new(router: &'a FeeRouter<P>, wallet: Address) -> Self {
         Self {
             router,
@@ -129,7 +285,7 @@ impl<'a, P: Provider> Trader<'a, P> {
     /// Runs prerequisites, then submits once. Pending approval returns without submitting a swap.
     pub async fn submit<S: Provider, J: ExecutionJournal>(
         &self,
-        execution: &mut Execution<S, J>,
+        execution: &mut Execution<'_, S, J>,
         request: TradeRequest,
         limits: SwapLimits,
     ) -> Result<ExecutionResult>
@@ -153,7 +309,7 @@ impl<'a, P: Provider> Trader<'a, P> {
     /// Submits, then waits up to the configured confirmation timeout. Timeout remains pending.
     pub async fn swap<S: Provider, J: ExecutionJournal>(
         &self,
-        execution: &mut Execution<S, J>,
+        execution: &mut Execution<'_, S, J>,
         request: TradeRequest,
         limits: SwapLimits,
     ) -> Result<ExecutionResult>
@@ -168,7 +324,7 @@ impl<'a, P: Provider> Trader<'a, P> {
     /// After approval, requotes the same hops but retains the original calldata and fee guard.
     pub async fn submit_prepared<S: Provider, J: ExecutionJournal>(
         &self,
-        execution: &mut Execution<S, J>,
+        execution: &mut Execution<'_, S, J>,
         prepared: PreparedSwap,
     ) -> Result<ExecutionResult>
     where
@@ -203,7 +359,7 @@ impl<'a, P: Provider> Trader<'a, P> {
     /// Executes the prepared route, then waits within the confirmation timeout.
     pub async fn swap_prepared<S: Provider, J: ExecutionJournal>(
         &self,
-        execution: &mut Execution<S, J>,
+        execution: &mut Execution<'_, S, J>,
         prepared: PreparedSwap,
     ) -> Result<ExecutionResult>
     where
@@ -215,7 +371,7 @@ impl<'a, P: Provider> Trader<'a, P> {
 
     async fn wait_for_swap<S: Provider, J: ExecutionJournal>(
         &self,
-        execution: &mut Execution<S, J>,
+        execution: &mut Execution<'_, S, J>,
         result: ExecutionResult,
     ) -> Result<ExecutionResult> {
         if result.status != ExecutionStatus::Pending || result.record.swap_hash().is_none() {
@@ -231,7 +387,7 @@ impl<'a, P: Provider> Trader<'a, P> {
     /// Reads existing transaction state only; never prepares, signs, submits or resends.
     pub async fn status<S: Provider, J: ExecutionJournal>(
         &self,
-        execution: &Execution<S, J>,
+        execution: &Execution<'_, S, J>,
         record: &ExecutionRecord,
     ) -> Result<ExecutionResult> {
         execution
@@ -269,7 +425,7 @@ impl<'a, P: Provider> Trader<'a, P> {
             .ok_or_else(|| Error::InvalidTrade("latest block was not returned".into()))?
             .header;
         let router = FeeRouter::connect(self.router.client.clone(), block.hash).await?;
-        let trader = Trader {
+        let trader = WalletTrader {
             router: &router,
             wallet: self.wallet,
             native_settlement: self.native_settlement,

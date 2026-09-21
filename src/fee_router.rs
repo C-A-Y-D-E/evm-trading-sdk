@@ -9,6 +9,7 @@ mod trader;
 pub use price_impact::{PriceImpact, PriceImpactUnavailable};
 pub use trader::{
     BuyWith, FundingQuoteFailure, FundingReport, PairSwap, PreparedSwap, TradeSide, Trader,
+    WalletTrader,
 };
 
 use crate::{
@@ -59,8 +60,8 @@ fn calculate_fee(amount: U256, fee_bps: u16) -> U256 {
 }
 
 impl<P: Provider> FeeRouter<P> {
-    pub fn trader(&self, wallet: Address) -> Trader<'_, P> {
-        Trader::new(self, wallet)
+    pub fn trader(&self, wallet: Address) -> WalletTrader<'_, P> {
+        WalletTrader::new(self, wallet)
     }
 
     /// Connects to our deployed router and reads its configuration at the quote block.

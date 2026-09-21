@@ -1,5 +1,7 @@
 use std::{future::Future, time::Duration};
 
+use alloy_consensus::transaction::SignerRecoverable;
+use alloy_network::{Ethereum, EthereumWallet, NetworkWallet, TransactionBuilder};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, transport::TransportError};
 use alloy_rpc_types_eth::{TransactionReceipt, TransactionRequest};
@@ -9,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     EvmClient, PairSwap, PreparedSwap,
     dex::{Error, Result, SwapLimits},
+    submit::{SubmitError, Submitter},
     uniswap::v4::{V4PoolLookup, V4QuoteOptions},
 };
 
@@ -42,6 +45,9 @@ pub struct TransactionRecord {
     pub transaction: TransactionRequest,
     pub submission: SubmissionState,
     pub receipt: Option<TransactionReceipt>,
+    /// Computed before broadcast; its presence does not imply service acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_hash: Option<B256>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -50,12 +56,14 @@ pub struct ExecutionRecord {
 }
 
 impl ExecutionRecord {
+    /// A known swap identifier, including a signed transaction with uncertain broadcast.
     pub fn swap_hash(&self) -> Option<B256> {
         self.transactions
             .iter()
             .rev()
             .find_map(|tx| match (tx.kind, tx.submission) {
                 (TransactionKind::Swap, SubmissionState::Submitted(hash)) => Some(hash),
+                (TransactionKind::Swap, SubmissionState::Unknown) => tx.signed_hash,
                 _ => None,
             })
     }
@@ -88,6 +96,7 @@ pub enum ExecutionStage {
     Simulation,
     Estimation,
     Wallet,
+    Signing,
     Persistence,
     Submission,
     Confirmation,
@@ -102,6 +111,14 @@ pub enum ExecutionFailure {
     Rejected(#[source] TransportError),
     #[error("submission outcome is unknown; do not resend automatically")]
     UnknownSubmission(#[source] TransportError),
+    #[error("transaction signing failed; nothing was broadcast")]
+    Signing(#[source] alloy_signer::Error),
+    #[error("signed payload or signer differs from the prepared transaction")]
+    SignatureMismatch,
+    #[error("broadcast was rejected")]
+    BroadcastRejected(#[source] SubmitError),
+    #[error("broadcast outcome is unknown; check the saved signed hash without resending")]
+    UnknownBroadcast(#[source] SubmitError),
     #[error("input balance {available} is below required {required}")]
     InsufficientFunds { available: U256, required: U256 },
     #[error("approval simulation returned false")]
@@ -138,6 +155,16 @@ pub trait ExecutionJournal {
     fn save(&mut self, record: &ExecutionRecord) -> std::result::Result<(), Source>;
 }
 
+impl<J: ExecutionJournal + ?Sized> ExecutionJournal for &mut J {
+    fn begin(&mut self, record: &ExecutionRecord) -> std::result::Result<(), Source> {
+        (**self).begin(record)
+    }
+
+    fn save(&mut self, record: &ExecutionRecord) -> std::result::Result<(), Source> {
+        (**self).save(record)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutionOptions {
     pub confirmation_timeout: Duration,
@@ -155,23 +182,45 @@ impl Default for ExecutionOptions {
     }
 }
 
-/// Execution through a wallet RPC that implements `eth_sendTransaction` (such as Frame).
-/// The provider transport must not retry send requests; local signer/filler submission is not used.
-pub struct Execution<S, J> {
+/// Execution defaults to wallet RPC `eth_sendTransaction` (such as Frame).
+/// `with_submitter` uses an Alloy wallet for signing and a separate broadcaster.
+/// Wallet RPC and submitter transports must not retry sends.
+pub struct Execution<'a, S, J> {
     provider: S,
     journal: J,
     options: ExecutionOptions,
     record: ExecutionRecord,
+    signed_submission: Option<SignedSubmission<'a>>,
 }
 
-impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
+struct SignedSubmission<'a> {
+    wallet: EthereumWallet,
+    submitter: Box<dyn Submitter + 'a>,
+}
+
+impl<'a, S: Provider, J: ExecutionJournal> Execution<'a, S, J> {
     pub fn new(provider: S, journal: J, options: ExecutionOptions) -> Self {
         Self {
             provider,
             journal,
             options,
             record: ExecutionRecord::default(),
+            signed_submission: None,
         }
+    }
+
+    /// The provider supplies reads, simulation and fees; the wallet only signs.
+    /// In this mode `check_rpc_account` is replaced by checking the wallet's signing credentials.
+    pub fn with_submitter(
+        mut self,
+        wallet: EthereumWallet,
+        submitter: impl Submitter + 'a,
+    ) -> Self {
+        self.signed_submission = Some(SignedSubmission {
+            wallet,
+            submitter: Box::new(submitter),
+        });
+        self
     }
 
     /// Read-only preflight. ApprovalRequired means the swap has not been simulated.
@@ -318,7 +367,19 @@ impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
             self.failure(ExecutionStage::Wallet, ExecutionFailure::RecordMismatch)
         })?;
         self.check_chain(chain).await?;
-        if self.options.check_rpc_account {
+        if let Some(signed) = &self.signed_submission {
+            signed.submitter.check_chain(chain).map_err(|error| {
+                self.failure(
+                    ExecutionStage::Submission,
+                    ExecutionFailure::BroadcastRejected(error),
+                )
+            })?;
+            if signed.wallet.signer_by_address(wallet).is_none() {
+                return Err(
+                    self.failure(ExecutionStage::Wallet, ExecutionFailure::WalletUnavailable)
+                );
+            }
+        } else if self.options.check_rpc_account {
             let accounts = self
                 .provider
                 .get_accounts()
@@ -332,7 +393,19 @@ impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
         }
         // Frame consumes `data`; keep every SDK byte when serializing through Alloy.
         transaction.normalize_data();
-        self.simulate(&transaction, kind).await?;
+        if self.signed_submission.is_some() {
+            let fees = self
+                .provider
+                .estimate_eip1559_fees()
+                .await
+                .map_err(|error| self.rpc_error(ExecutionStage::Estimation, error))?;
+            transaction.transaction_type = Some(2);
+            transaction.gas_price = None;
+            transaction.max_fee_per_gas = Some(fees.max_fee_per_gas);
+            transaction.max_priority_fee_per_gas = Some(fees.max_priority_fee_per_gas);
+        } else {
+            self.simulate(&transaction, kind).await?;
+        }
         let estimate = self
             .provider
             .estimate_gas(transaction.clone())
@@ -347,6 +420,9 @@ impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
                 .await
                 .map_err(|error| self.rpc_error(ExecutionStage::Wallet, error))?,
         );
+        if self.signed_submission.is_some() {
+            self.simulate(&transaction, kind).await?;
+        }
         self.check_deadline(limits)?;
         let first = self.record.transactions.is_empty();
         self.record.transactions.push(TransactionRecord {
@@ -354,8 +430,12 @@ impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
             transaction: transaction.clone(),
             submission: SubmissionState::Unknown,
             receipt: None,
+            signed_hash: None,
         });
         self.persist(first)?;
+        if self.signed_submission.is_some() {
+            return self.send_signed(transaction, limits).await;
+        }
         // A transport error can follow a successful send. Never retry or choose another trade.
         let result: std::result::Result<B256, TransportError> = self
             .provider
@@ -385,6 +465,91 @@ impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
                 ));
             }
         }
+        self.persist(false)
+    }
+
+    async fn send_signed(
+        &mut self,
+        transaction: TransactionRequest,
+        limits: SwapLimits,
+    ) -> Result<()> {
+        let config = self
+            .signed_submission
+            .as_ref()
+            .expect("signed submission configured");
+        let envelope = match NetworkWallet::<Ethereum>::sign_request(
+            &config.wallet,
+            transaction.clone(),
+        )
+        .await
+        {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                self.reject_submission()?;
+                return Err(self.failure(ExecutionStage::Signing, ExecutionFailure::Signing(error)));
+            }
+        };
+        let expected = transaction.clone().build_unsigned().map_err(|error| {
+            self.failure(
+                ExecutionStage::Signing,
+                ExecutionFailure::Operation(Box::new(error)),
+            )
+        })?;
+        if envelope.clone().into_typed_transaction() != expected
+            || envelope.recover_signer().ok() != transaction.from
+        {
+            self.reject_submission()?;
+            return Err(self.failure(ExecutionStage::Signing, ExecutionFailure::SignatureMismatch));
+        }
+        let hash = *envelope.tx_hash();
+        self.record.transactions.last_mut().unwrap().signed_hash = Some(hash);
+        if let Err(error) = self.check_deadline(limits) {
+            self.reject_submission()?;
+            return Err(match error {
+                Error::Execution(mut error) => {
+                    error.stage = ExecutionStage::Signing;
+                    error.record = self.record.clone();
+                    Error::Execution(error)
+                }
+                error => error,
+            });
+        }
+        // Persist the locally computed hash before POST, so a lost response can be reconciled.
+        self.persist(false)?;
+        let result = self
+            .signed_submission
+            .as_ref()
+            .unwrap()
+            .submitter
+            .submit(&envelope)
+            .await;
+        let error = match result {
+            Ok(returned) if returned == hash => {
+                self.record.transactions.last_mut().unwrap().submission =
+                    SubmissionState::Submitted(hash);
+                return self.persist(false);
+            }
+            Ok(actual) => SubmitError::HashMismatch {
+                expected: hash,
+                actual,
+            },
+            Err(error) => error,
+        };
+        if error.is_rejection() {
+            self.reject_submission()?;
+            return Err(self.failure(
+                ExecutionStage::Submission,
+                ExecutionFailure::BroadcastRejected(error),
+            ));
+        }
+        Err(self.failure(
+            ExecutionStage::Submission,
+            ExecutionFailure::UnknownBroadcast(error),
+        ))
+    }
+
+    fn reject_submission(&mut self) -> Result<()> {
+        self.record.transactions.last_mut().unwrap().submission = SubmissionState::Rejected;
         self.persist(false)
     }
 
@@ -419,11 +584,14 @@ impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
 
     async fn check_gas_funding(&self, transaction: &TransactionRequest) -> Result<()> {
         let wallet = transaction.from.expect("validated sender");
-        let price = self
-            .provider
-            .get_gas_price()
-            .await
-            .map_err(|error| self.rpc_error(ExecutionStage::Estimation, error))?;
+        let price = match transaction.max_fee_per_gas.or(transaction.gas_price) {
+            Some(price) => price,
+            None => self
+                .provider
+                .get_gas_price()
+                .await
+                .map_err(|error| self.rpc_error(ExecutionStage::Estimation, error))?,
+        };
         let available = self
             .provider
             .get_balance(wallet)
@@ -458,74 +626,7 @@ impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
         chain: u64,
         record: &ExecutionRecord,
     ) -> Result<ExecutionResult> {
-        let mut updated = record.clone();
-        let error = |failure| execution_error(ExecutionStage::Confirmation, failure, record);
-        if record.transactions.is_empty()
-            || record.transactions.iter().any(|tx| {
-                tx.transaction.from != Some(wallet) || tx.transaction.chain_id != Some(chain)
-            })
-        {
-            return Err(error(ExecutionFailure::RecordMismatch));
-        }
-        let actual = self
-            .provider
-            .get_chain_id()
-            .await
-            .map_err(|source| error(ExecutionFailure::Operation(Box::new(source))))?;
-        if actual != chain {
-            return Err(error(ExecutionFailure::RecordMismatch));
-        }
-        let mut status = ExecutionStatus::Confirmed;
-        for tx in &mut updated.transactions {
-            let hash = match tx.submission {
-                SubmissionState::Unknown => {
-                    status = ExecutionStatus::Pending;
-                    continue;
-                }
-                SubmissionState::Rejected => {
-                    return Ok(ExecutionResult {
-                        status: ExecutionStatus::Failed,
-                        record: updated,
-                    });
-                }
-                SubmissionState::Submitted(hash) => hash,
-            };
-            let receipt = self
-                .provider
-                .get_transaction_receipt(hash)
-                .await
-                .map_err(|source| error(ExecutionFailure::Operation(Box::new(source))))?;
-            let Some(receipt) = receipt else {
-                tx.receipt = None;
-                status = ExecutionStatus::Pending;
-                continue;
-            };
-            let mined: Option<TransactionRequest> = self
-                .provider
-                .raw_request("eth_getTransactionByHash".into(), (hash,))
-                .await
-                .map_err(|source| error(ExecutionFailure::Operation(Box::new(source))))?;
-            if receipt.transaction_hash != hash
-                || receipt.block_hash.is_none()
-                || !mined
-                    .as_ref()
-                    .is_some_and(|mined| same_transaction(&tx.transaction, mined))
-            {
-                return Err(error(ExecutionFailure::TransactionMismatch));
-            }
-            let success = receipt.status();
-            tx.receipt = Some(receipt);
-            if !success {
-                return Ok(ExecutionResult {
-                    status: ExecutionStatus::Failed,
-                    record: updated,
-                });
-            }
-        }
-        Ok(ExecutionResult {
-            status,
-            record: updated,
-        })
+        check_status(&self.provider, wallet, chain, record).await
     }
 
     pub(crate) async fn wait(
@@ -626,6 +727,88 @@ impl<S: Provider, J: ExecutionJournal> Execution<S, J> {
     fn failure(&self, stage: ExecutionStage, failure: ExecutionFailure) -> Error {
         execution_error(stage, failure, &self.record)
     }
+}
+
+pub(crate) async fn check_status<P: Provider>(
+    provider: &P,
+    wallet: Address,
+    chain: u64,
+    record: &ExecutionRecord,
+) -> Result<ExecutionResult> {
+    let mut updated = record.clone();
+    let error = |failure| execution_error(ExecutionStage::Confirmation, failure, record);
+    if record.transactions.is_empty()
+        || record
+            .transactions
+            .iter()
+            .any(|tx| tx.transaction.from != Some(wallet) || tx.transaction.chain_id != Some(chain))
+    {
+        return Err(error(ExecutionFailure::RecordMismatch));
+    }
+    let actual = provider
+        .get_chain_id()
+        .await
+        .map_err(|source| error(ExecutionFailure::Operation(Box::new(source))))?;
+    if actual != chain {
+        return Err(error(ExecutionFailure::RecordMismatch));
+    }
+    let mut status = ExecutionStatus::Confirmed;
+    for tx in &mut updated.transactions {
+        if let (Some(signed), SubmissionState::Submitted(submitted)) =
+            (tx.signed_hash, tx.submission)
+            && signed != submitted
+        {
+            return Err(error(ExecutionFailure::RecordMismatch));
+        }
+        let hash = match tx.submission {
+            SubmissionState::Unknown if tx.signed_hash.is_some() => tx.signed_hash.unwrap(),
+            SubmissionState::Unknown => {
+                status = ExecutionStatus::Pending;
+                continue;
+            }
+            SubmissionState::Rejected => {
+                return Ok(ExecutionResult {
+                    status: ExecutionStatus::Failed,
+                    record: updated,
+                });
+            }
+            SubmissionState::Submitted(hash) => hash,
+        };
+        let receipt = provider
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(|source| error(ExecutionFailure::Operation(Box::new(source))))?;
+        let Some(receipt) = receipt else {
+            tx.receipt = None;
+            status = ExecutionStatus::Pending;
+            continue;
+        };
+        let mined: Option<TransactionRequest> = provider
+            .raw_request("eth_getTransactionByHash".into(), (hash,))
+            .await
+            .map_err(|source| error(ExecutionFailure::Operation(Box::new(source))))?;
+        if receipt.transaction_hash != hash
+            || receipt.block_hash.is_none()
+            || !mined
+                .as_ref()
+                .is_some_and(|mined| same_transaction(&tx.transaction, mined))
+        {
+            return Err(error(ExecutionFailure::TransactionMismatch));
+        }
+        let success = receipt.status();
+        tx.submission = SubmissionState::Submitted(hash);
+        tx.receipt = Some(receipt);
+        if !success {
+            return Ok(ExecutionResult {
+                status: ExecutionStatus::Failed,
+                record: updated,
+            });
+        }
+    }
+    Ok(ExecutionResult {
+        status,
+        record: updated,
+    })
 }
 
 fn execution_error(

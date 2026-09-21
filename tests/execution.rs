@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::{
@@ -9,15 +10,21 @@ use std::{
     time::Duration,
 };
 
+use alloy_consensus::{Transaction, TxEnvelope, transaction::SignerRecoverable};
+use alloy_eips::eip2718::Decodable2718;
+use alloy_network::EthereumWallet;
 use alloy_primitives::{
     Address, B256, Bytes, U256, address,
     aliases::{I24, U24, U160},
 };
 use alloy_provider::{ProviderBuilder, RootProvider};
-use alloy_rpc_types_eth::{Block, Transaction};
+use alloy_rpc_types_eth::{Block, Transaction as RpcTransaction, TransactionRequest};
+use alloy_signer::Signer;
+use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolValue, sol};
 use evm_trading_sdk::{
-    BuyWith, Error, EvmClient, FeeRouter, PairSwap, ROBINHOOD_CHAIN_ID, TradeSide,
+    BloxrouteSubmitter, BuyWith, Error, EvmClient, FeeRouter, PairSwap, ROBINHOOD_CHAIN_ID,
+    SubmitError, TradeSide, Trader,
     dex::SwapLimits,
     execution::{
         Execution, ExecutionFailure, ExecutionJournal, ExecutionOptions, ExecutionRecord,
@@ -28,7 +35,7 @@ use evm_trading_sdk::{
 };
 use serde_json::{Value, json};
 
-const WALLET: Address = Address::repeat_byte(1);
+const WALLET: Address = address!("7e5f4552091a69125d5dfcb7b8c2659029395bdf");
 const WETH: Address = address!("0bd7d308f8e1639fab988df18a8011f41eacad73");
 const TOKEN: Address = address!("d0601ce157db5bdc3162bbac2a2c8af5320d9eec");
 const POOL: Address = address!("62ab521f71431f78ac374cdbadc6cda3c8916b6c");
@@ -50,6 +57,10 @@ struct Scenario {
     invisible_allowance: bool,
     worse_quote: bool,
     changed_fee: bool,
+    blox_status: u16,
+    blox_wrong_hash: bool,
+    blox_drop: bool,
+    blox_malformed: bool,
 }
 
 #[derive(Default)]
@@ -58,6 +69,8 @@ struct State {
     sent: Vec<Value>,
     journal: Vec<ExecutionRecord>,
     approved: bool,
+    approved_wallets: HashSet<Address>,
+    hashes: Vec<B256>,
 }
 
 #[derive(Clone)]
@@ -72,7 +85,13 @@ impl ExecutionJournal for Journal {
         record: &ExecutionRecord,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut state = self.state.lock().unwrap();
-        if !state.journal.is_empty() {
+        let wallet = record.transactions[0].transaction.from;
+        if state.journal.iter().any(|saved| {
+            saved
+                .transactions
+                .first()
+                .is_some_and(|tx| tx.transaction.from == wallet)
+        }) {
             return Err("unresolved execution".into());
         }
         state.journal.push(record.clone());
@@ -142,13 +161,10 @@ impl Rpc {
             .unwrap()
     }
 
-    fn execution(&self) -> Execution<RootProvider, Journal> {
+    fn execution(&self) -> Execution<'static, RootProvider, Journal> {
         Execution::new(
             self.provider(),
-            Journal {
-                state: self.state.clone(),
-                fail_hash_save: self.scenario.fail_hash_save,
-            },
+            self.journal(),
             ExecutionOptions {
                 confirmation_timeout: if self.scenario.pending {
                     Duration::from_millis(60)
@@ -164,6 +180,34 @@ impl Rpc {
     fn sends(&self) -> usize {
         self.state.lock().unwrap().sent.len()
     }
+
+    fn journal(&self) -> Journal {
+        Journal {
+            state: self.state.clone(),
+            fail_hash_save: self.scenario.fail_hash_save,
+        }
+    }
+
+    fn blox_execution(&self) -> Execution<'static, RootProvider, Journal> {
+        self.execution().with_submitter(
+            EthereumWallet::from(test_signer()),
+            BloxrouteSubmitter::fast(&self.url, "test-auth").unwrap(),
+        )
+    }
+
+    fn blox_calls(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(method, _)| method == "robinhood_tx")
+            .count()
+    }
+}
+
+fn test_signer() -> PrivateKeySigner {
+    PrivateKeySigner::from_bytes(&B256::from(U256::from(1))).unwrap()
 }
 
 impl Drop for Rpc {
@@ -182,7 +226,7 @@ fn serve(stream: TcpStream, shared: &Mutex<State>, scenario: Scenario) {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let mut reader = BufReader::new(stream);
-    let request = match read_request(&mut reader) {
+    let (request, authorization) = match read_request(&mut reader) {
         Ok(Some(request)) => request,
         Ok(None) => return,
         // Deadline cancellation can leave an idle or partially written HTTP connection.
@@ -203,22 +247,43 @@ fn serve(stream: TcpStream, shared: &Mutex<State>, scenario: Scenario) {
     let params = &request["params"];
     let mut state = shared.lock().unwrap();
     state.calls.push((method.to_owned(), params.clone()));
-    let result = response(method, params, &mut state, scenario);
-    let payload = match result {
+    let is_blox = method == "robinhood_tx";
+    if is_blox {
+        assert_eq!(authorization.as_deref(), Some("test-auth"));
+    }
+    let status = if is_blox && scenario.blox_status != 0 {
+        scenario.blox_status
+    } else {
+        200
+    };
+    let result = if status == 200 {
+        response(method, params, &mut state, scenario)
+    } else {
+        Ok(Value::Null)
+    };
+    if is_blox && scenario.blox_drop {
+        return;
+    }
+    let payload = if is_blox && scenario.blox_malformed {
+        "invalid JSON".to_owned()
+    } else {
+        match result {
         Ok(value) => json!({"jsonrpc":"2.0", "id":request["id"], "result":value}),
         Err(code) => json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":code, "message":"mock rejection"}}),
-    }.to_string();
+    }.to_string()
+    };
     let mut stream = reader.into_inner();
     let _ = write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nLocation: /redirect\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         payload.len(),
         payload
     );
 }
 
-fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<Value>> {
+fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<(Value, Option<String>)>> {
     let mut length = 0;
+    let mut authorization = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -226,6 +291,11 @@ fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<Value>> {
         }
         if line == "\r\n" {
             break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("authorization")
+        {
+            authorization = Some(value.trim().to_owned());
         }
         if let Some((name, value)) = line.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
@@ -239,7 +309,7 @@ fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<Value>> {
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
     serde_json::from_slice(&body)
-        .map(Some)
+        .map(|body| Some((body, authorization)))
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
@@ -268,8 +338,18 @@ fn response(
             10_000_000_000u64
         })),
         "eth_gasPrice" => json!("0x1"),
+        "eth_feeHistory" => {
+            json!({"oldestBlock":"0x7","baseFeePerGas":["0x1","0x1"],"gasUsedRatio":[0.5],"reward":[["0x1"]]})
+        }
         "eth_estimateGas" => json!("0x5208"),
-        "eth_getTransactionCount" => json!(format!("0x{:x}", state.sent.len())),
+        "eth_getTransactionCount" => json!(format!(
+            "0x{:x}",
+            state
+                .sent
+                .iter()
+                .filter(|tx| tx["from"] == params[0])
+                .count()
+        )),
         "eth_call" => contract_call(&params[0], state, scenario)?,
         "eth_sendTransaction" => {
             let tx = params[0].clone();
@@ -285,6 +365,7 @@ fn response(
             assert!(tx.get("input").is_none(), "Frame requires data");
             assert_ne!(tx["data"], "0x");
             state.sent.push(tx);
+            state.hashes.push(B256::repeat_byte(state.sent.len() as u8));
             if scenario.reject_wallet {
                 return Err(4001);
             }
@@ -292,6 +373,51 @@ fn response(
                 return Err(-32000);
             }
             json!(B256::repeat_byte(state.sent.len() as u8))
+        }
+        "robinhood_tx" => {
+            assert_eq!(params.as_object().unwrap().len(), 1);
+            let hex = params["transaction"].as_str().unwrap();
+            assert!(!hex.starts_with("0x"));
+            let bytes = alloy_primitives::hex::decode(hex).unwrap();
+            let mut input = bytes.as_slice();
+            let envelope = TxEnvelope::decode_2718(&mut input).unwrap();
+            assert!(input.is_empty());
+            assert!(envelope.is_eip1559());
+            assert_eq!(envelope.chain_id(), Some(ROBINHOOD_CHAIN_ID));
+            let sender = envelope.recover_signer().unwrap();
+            let hash = *envelope.tx_hash();
+            let tx = TransactionRequest::from_transaction_with_sender(envelope, sender)
+                .normalized_data();
+            let saved = state
+                .journal
+                .iter()
+                .rev()
+                .flat_map(|record| record.transactions.iter().rev())
+                .find(|tx| tx.signed_hash == Some(hash))
+                .expect("signed hash must be durable before POST");
+            assert_eq!(saved.submission, SubmissionState::Unknown);
+            assert_eq!(
+                saved.signed_hash,
+                Some(hash),
+                "hash must be durable before POST"
+            );
+            assert_eq!(saved.transaction.from, tx.from);
+            assert_eq!(saved.transaction.to, tx.to);
+            assert_eq!(saved.transaction.input, tx.input);
+            assert_eq!(saved.transaction.value, tx.value);
+            assert_eq!(saved.transaction.nonce, tx.nonce);
+            assert_eq!(saved.transaction.gas, tx.gas);
+            assert_eq!(saved.transaction.max_fee_per_gas, tx.max_fee_per_gas);
+            assert_eq!(
+                saved.transaction.max_priority_fee_per_gas,
+                tx.max_priority_fee_per_gas
+            );
+            state.sent.push(serde_json::to_value(tx).unwrap());
+            state.hashes.push(hash);
+            if scenario.unknown_send {
+                return Err(-32000);
+            }
+            json!({"txHash":if scenario.blox_wrong_hash { B256::repeat_byte(255) } else { hash }})
         }
         "eth_getTransactionReceipt" => {
             if scenario.receipt_error {
@@ -301,15 +427,26 @@ fn response(
                 return Ok(Value::Null);
             }
             let hash: B256 = serde_json::from_value(params[0].clone()).unwrap();
-            let tx = &state.sent[hash[0] as usize - 1];
+            let Some(index) = state.hashes.iter().position(|candidate| *candidate == hash) else {
+                return Ok(Value::Null);
+            };
+            let tx = &state.sent[index];
             if tx["to"] == json!(TOKEN) && !scenario.revert {
                 state.approved = true;
+                state
+                    .approved_wallets
+                    .insert(serde_json::from_value(tx["from"].clone()).unwrap());
             }
-            json!({"transactionHash":hash, "transactionIndex":"0x0", "blockHash":B256::repeat_byte(9), "blockNumber":"0x9", "from":WALLET, "to":tx["to"], "cumulativeGasUsed":"0x5208", "gasUsed":"0x5208", "effectiveGasPrice":"0x1", "contractAddress":null, "logs":[], "logsBloom":format!("0x{}", "00".repeat(256)), "status":if scenario.revert { "0x0" } else { "0x1" }, "type":"0x0"})
+            json!({"transactionHash":hash, "transactionIndex":"0x0", "blockHash":B256::repeat_byte(9), "blockNumber":"0x9", "from":tx["from"], "to":tx["to"], "cumulativeGasUsed":"0x5208", "gasUsed":"0x5208", "effectiveGasPrice":"0x1", "contractAddress":null, "logs":[], "logsBloom":format!("0x{}", "00".repeat(256)), "status":if scenario.revert { "0x0" } else { "0x1" }, "type":"0x0"})
         }
         "eth_getTransactionByHash" => {
             let hash: B256 = serde_json::from_value(params[0].clone()).unwrap();
-            let mut tx = state.sent[hash[0] as usize - 1].clone();
+            let index = state
+                .hashes
+                .iter()
+                .position(|candidate| *candidate == hash)
+                .unwrap();
+            let mut tx = state.sent[index].clone();
             tx["input"] = tx["data"].take();
             if scenario.changed_payload {
                 tx["input"] = json!("0x");
@@ -320,7 +457,7 @@ fn response(
             if scenario.refresh_error {
                 return Err(-32000);
             }
-            let mut block = Block::<Transaction>::default();
+            let mut block = Block::<RpcTransaction>::default();
             block.header.hash = B256::repeat_byte(8);
             block.header.number = 8;
             block.header.timestamp = 100;
@@ -384,11 +521,14 @@ fn contract_call(tx: &Value, state: &State, scenario: Scenario) -> Result<Value,
     } else if selector == signature("balanceOf(address)") {
         encoded(U256::from(100000))
     } else if selector == signature("allowance(address,address)") {
-        encoded(if state.approved && !scenario.invisible_allowance {
-            U256::from(10000)
-        } else {
-            U256::ZERO
-        })
+        let owner = Address::from_slice(&input[16..36]);
+        encoded(
+            if state.approved_wallets.contains(&owner) && !scenario.invisible_allowance {
+                U256::from(10000)
+            } else {
+                U256::ZERO
+            },
+        )
     } else if to == deployment.v3.unwrap().quoter_v2 {
         encoded((
             U256::from(if state.approved {
@@ -426,6 +566,433 @@ fn execution_error(error: Error) -> Box<evm_trading_sdk::execution::ExecutionErr
         panic!("expected execution context: {error:?}")
     };
     error
+}
+
+#[tokio::test]
+async fn shared_trader_keeps_concurrent_wallets_and_approvals_separate() {
+    fn sendable<T: Send>(future: T) -> T {
+        future
+    }
+
+    let rpc = Rpc::new(Scenario::default());
+    let router = rpc.router().await;
+    let trader = Trader::new(&router);
+    let blox = BloxrouteSubmitter::fast(&rpc.url, "test-auth").unwrap();
+    let alice = EthereumWallet::from(test_signer());
+    let bob =
+        EthereumWallet::from(PrivateKeySigner::from_bytes(&B256::from(U256::from(2))).unwrap());
+    let bob_address = bob.default_signer().address();
+    let mut alice_journal = rpc.journal();
+    let mut bob_journal = rpc.journal();
+    let TradeRequest::Pair(buy) = request(TradeSide::Buy) else {
+        unreachable!()
+    };
+    let prepared = trader.prepare_swap(WALLET, buy, limits()).await.unwrap();
+    assert_eq!(prepared.quote.request.trade.sender, WALLET);
+    assert_eq!(prepared.quote.request.trade.recipient, WALLET);
+    assert_eq!(rpc.blox_calls(), 0);
+
+    let (alice_result, bob_result) = tokio::join!(
+        sendable(trader.swap_prepared(prepared, &alice, &blox, &mut alice_journal)),
+        sendable(trader.swap(
+            request(TradeSide::Sell),
+            limits(),
+            &bob,
+            &blox,
+            &mut bob_journal
+        )),
+    );
+    let alice_result = alice_result.unwrap();
+    let bob_result = bob_result.unwrap();
+    assert_eq!(alice_result.record.transactions.len(), 1);
+    assert_eq!(bob_result.record.transactions.len(), 2);
+    assert_eq!(
+        bob_result.record.transactions[0].kind,
+        TransactionKind::Approval
+    );
+    assert_ne!(
+        alice_result.record.swap_hash(),
+        bob_result.record.swap_hash()
+    );
+    for (result, wallet) in [(&alice_result, WALLET), (&bob_result, bob_address)] {
+        assert_eq!(result.status, ExecutionStatus::Confirmed);
+        for (nonce, tx) in result.record.transactions.iter().enumerate() {
+            assert_eq!(tx.transaction.from, Some(wallet));
+            assert_eq!(tx.transaction.nonce, Some(nonce as u64));
+        }
+        assert_eq!(
+            trader.status(&result.record).await.unwrap().status,
+            ExecutionStatus::Confirmed
+        );
+    }
+    let state = rpc.state.lock().unwrap();
+    assert_eq!(state.sent.len(), 3);
+    for record in &state.journal {
+        let owner = record.transactions[0].transaction.from;
+        assert!(
+            record
+                .transactions
+                .iter()
+                .all(|tx| tx.transaction.from == owner)
+        );
+    }
+    assert!(state.approved_wallets.contains(&bob_address));
+    assert!(!state.approved_wallets.contains(&WALLET));
+    assert!(
+        !state
+            .calls
+            .iter()
+            .any(|(method, _)| method == "eth_accounts")
+    );
+}
+
+#[tokio::test]
+async fn shared_trader_rejects_another_wallets_preview_before_signing() {
+    let rpc = Rpc::new(Scenario::default());
+    let router = rpc.router().await;
+    let trader = Trader::new(&router);
+    let blox = BloxrouteSubmitter::fast(&rpc.url, "test-auth").unwrap();
+    let other =
+        EthereumWallet::from(PrivateKeySigner::from_bytes(&B256::from(U256::from(2))).unwrap());
+    let TradeRequest::Pair(buy) = request(TradeSide::Buy) else {
+        unreachable!()
+    };
+    let prepared = trader.prepare_swap(WALLET, buy, limits()).await.unwrap();
+    let error = execution_error(
+        trader
+            .submit_prepared(prepared, &other, &blox, &mut rpc.journal())
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(error.stage, ExecutionStage::Preparation);
+    assert!(error.record.transactions.is_empty());
+    assert!(rpc.state.lock().unwrap().journal.is_empty());
+    assert_eq!(rpc.blox_calls(), 0);
+}
+
+#[tokio::test]
+async fn shared_trader_does_not_carry_a_rejected_signer_into_the_next_trade() {
+    let rpc = Rpc::new(Scenario::default());
+    let router = rpc.router().await;
+    let trader = Trader::new(&router);
+    let blox = BloxrouteSubmitter::fast(&rpc.url, "test-auth").unwrap();
+    let rejected = EthereumWallet::from(test_signer().with_chain_id(Some(1)));
+    let accepted =
+        EthereumWallet::from(PrivateKeySigner::from_bytes(&B256::from(U256::from(2))).unwrap());
+    let error = execution_error(
+        trader
+            .submit(
+                request(TradeSide::Buy),
+                limits(),
+                &rejected,
+                &blox,
+                &mut rpc.journal(),
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(error.stage, ExecutionStage::Signing);
+    assert_eq!(rpc.blox_calls(), 0);
+    let result = trader
+        .submit(
+            request(TradeSide::Buy),
+            limits(),
+            &accepted,
+            &blox,
+            &mut rpc.journal(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecutionStatus::Pending);
+    assert_eq!(result.record.transactions.len(), 1);
+    assert_eq!(
+        result.record.transactions[0].transaction.from,
+        Some(accepted.default_signer().address())
+    );
+    assert_eq!(
+        trader.status(&result.record).await.unwrap().status,
+        ExecutionStatus::Confirmed
+    );
+    assert_eq!(
+        trader.status(&error.record).await.unwrap().status,
+        ExecutionStatus::Failed
+    );
+    assert_eq!(rpc.blox_calls(), 1);
+}
+
+#[tokio::test]
+async fn bloxroute_signs_and_submits_approval_before_the_previewed_swap() {
+    let rpc = Rpc::new(Scenario::default());
+    let router = rpc.router().await;
+    let trader = Trader::new(&router);
+    let signer = EthereumWallet::from(test_signer());
+    let blox = BloxrouteSubmitter::fast(&rpc.url, "test-auth").unwrap();
+    let TradeRequest::Pair(request) = request(TradeSide::Sell) else {
+        unreachable!()
+    };
+    let prepared = trader
+        .prepare_swap(WALLET, request, limits())
+        .await
+        .unwrap();
+    let expected = prepared.plan.transaction.input.input().unwrap().clone();
+    let result = trader
+        .swap_prepared(prepared, &signer, &blox, &mut rpc.journal())
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecutionStatus::Confirmed);
+    assert_eq!(rpc.blox_calls(), 2);
+    let state = rpc.state.lock().unwrap();
+    assert_eq!(state.sent[1]["data"], json!(expected));
+    assert_eq!(result.record.swap_hash(), Some(state.hashes[1]));
+    assert!(!state.calls.iter().any(|(method, _)| matches!(
+        method.as_str(),
+        "eth_accounts" | "eth_sendTransaction" | "eth_sendRawTransaction"
+    )));
+    let approval_receipt = state
+        .calls
+        .iter()
+        .position(|(method, _)| method == "eth_getTransactionReceipt")
+        .unwrap();
+    let swap_submit = state
+        .calls
+        .iter()
+        .rposition(|(method, _)| method == "robinhood_tx")
+        .unwrap();
+    assert!(approval_receipt < swap_submit);
+    let stored = serde_json::to_value(&result.record).unwrap();
+    assert!(stored["transactions"][0]["signed_hash"].is_string());
+    let round_trip: ExecutionRecord = serde_json::from_value(stored).unwrap();
+    assert_eq!(round_trip.swap_hash(), result.record.swap_hash());
+}
+
+#[tokio::test]
+async fn uncertain_bloxroute_responses_keep_the_local_hash_and_never_resend() {
+    for scenario in [
+        Scenario {
+            blox_drop: true,
+            ..Default::default()
+        },
+        Scenario {
+            blox_malformed: true,
+            ..Default::default()
+        },
+        Scenario {
+            blox_wrong_hash: true,
+            ..Default::default()
+        },
+        Scenario {
+            unknown_send: true,
+            ..Default::default()
+        },
+        Scenario {
+            blox_status: 500,
+            ..Default::default()
+        },
+        Scenario {
+            blox_status: 307,
+            ..Default::default()
+        },
+    ] {
+        let rpc = Rpc::new(scenario);
+        let router = rpc.router().await;
+        let trader = Trader::new(&router);
+        let signer = EthereumWallet::from(test_signer());
+        let blox = BloxrouteSubmitter::fast(&rpc.url, "test-auth").unwrap();
+        let error = execution_error(
+            trader
+                .submit(
+                    request(TradeSide::Buy),
+                    limits(),
+                    &signer,
+                    &blox,
+                    &mut rpc.journal(),
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error.stage, ExecutionStage::Submission);
+        assert!(matches!(
+            error.failure,
+            ExecutionFailure::UnknownBroadcast(_)
+        ));
+        assert!(error.record.swap_hash().is_some());
+        assert_eq!(
+            error.record.transactions[0].submission,
+            SubmissionState::Unknown
+        );
+        for _ in 0..2 {
+            let status = trader.status(&error.record).await.unwrap();
+            assert_eq!(
+                status.status,
+                if scenario.blox_status == 0 {
+                    ExecutionStatus::Confirmed
+                } else {
+                    ExecutionStatus::Pending
+                }
+            );
+        }
+        assert_eq!(rpc.blox_calls(), 1);
+    }
+}
+
+#[tokio::test]
+async fn bloxroute_authentication_failure_is_a_definite_rejection() {
+    for code in [401, 403] {
+        let rpc = Rpc::new(Scenario {
+            blox_status: code,
+            ..Default::default()
+        });
+        let router = rpc.router().await;
+        let trader = router.trader(WALLET);
+        let execution = &mut rpc.blox_execution();
+        let error = execution_error(
+            trader
+                .submit(execution, request(TradeSide::Buy), limits())
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            matches!(error.failure, ExecutionFailure::BroadcastRejected(SubmitError::Http(status)) if status == code)
+        );
+        assert_eq!(
+            error.record.transactions[0].submission,
+            SubmissionState::Rejected
+        );
+        assert_eq!(
+            trader
+                .status(execution, &error.record)
+                .await
+                .unwrap()
+                .status,
+            ExecutionStatus::Failed
+        );
+        assert_eq!(rpc.blox_calls(), 1);
+        assert_eq!(rpc.sends(), 0);
+    }
+}
+
+#[tokio::test]
+async fn signing_failure_or_wrong_signature_never_reaches_bloxroute() {
+    let other = PrivateKeySigner::from_bytes(&B256::from(U256::from(2))).unwrap();
+    let impostor = PrivateKeySigner::new_with_credential(other.into_credential(), WALLET, None);
+    for (wallet, mismatch) in [
+        (
+            EthereumWallet::from(test_signer().with_chain_id(Some(1))),
+            false,
+        ),
+        (EthereumWallet::from(impostor), true),
+    ] {
+        let rpc = Rpc::new(Scenario::default());
+        let router = rpc.router().await;
+        let mut execution = rpc.execution().with_submitter(
+            wallet,
+            BloxrouteSubmitter::fast(&rpc.url, "test-auth").unwrap(),
+        );
+        let error = execution_error(
+            router
+                .trader(WALLET)
+                .submit(&mut execution, request(TradeSide::Buy), limits())
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error.stage, ExecutionStage::Signing);
+        assert!(if mismatch {
+            matches!(error.failure, ExecutionFailure::SignatureMismatch)
+        } else {
+            matches!(error.failure, ExecutionFailure::Signing(_))
+        });
+        assert_eq!(
+            error.record.transactions[0].submission,
+            SubmissionState::Rejected
+        );
+        assert_eq!(rpc.blox_calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn saving_the_signed_hash_must_succeed_before_broadcast() {
+    let rpc = Rpc::new(Scenario {
+        fail_hash_save: true,
+        ..Default::default()
+    });
+    let router = rpc.router().await;
+    let error = execution_error(
+        router
+            .trader(WALLET)
+            .submit(&mut rpc.blox_execution(), request(TradeSide::Buy), limits())
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(error.stage, ExecutionStage::Persistence);
+    assert!(error.record.swap_hash().is_some());
+    assert_eq!(rpc.blox_calls(), 0);
+}
+
+#[tokio::test]
+async fn bloxroute_preflight_failures_do_not_sign_or_broadcast() {
+    for scenario in [
+        Scenario {
+            reject_simulation: true,
+            ..Default::default()
+        },
+        Scenario {
+            low_gas_balance: true,
+            ..Default::default()
+        },
+    ] {
+        let rpc = Rpc::new(scenario);
+        let router = rpc.router().await;
+        let error = execution_error(
+            router
+                .trader(WALLET)
+                .submit(&mut rpc.blox_execution(), request(TradeSide::Buy), limits())
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(
+            error.stage,
+            if scenario.reject_simulation {
+                ExecutionStage::Simulation
+            } else {
+                ExecutionStage::Funding
+            }
+        );
+        assert!(error.record.transactions.is_empty());
+        assert!(rpc.state.lock().unwrap().journal.is_empty());
+        assert_eq!(rpc.blox_calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn bloxroute_timeout_and_revert_keep_their_transaction_hash() {
+    for scenario in [
+        Scenario {
+            pending: true,
+            ..Default::default()
+        },
+        Scenario {
+            revert: true,
+            ..Default::default()
+        },
+    ] {
+        let rpc = Rpc::new(scenario);
+        let router = rpc.router().await;
+        let result = router
+            .trader(WALLET)
+            .swap(&mut rpc.blox_execution(), request(TradeSide::Buy), limits())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status,
+            if scenario.pending {
+                ExecutionStatus::Pending
+            } else {
+                ExecutionStatus::Failed
+            }
+        );
+        assert!(result.record.swap_hash().is_some());
+        assert_eq!(rpc.blox_calls(), 1);
+    }
 }
 
 #[tokio::test]

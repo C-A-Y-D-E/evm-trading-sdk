@@ -1,6 +1,7 @@
 pub mod dex;
 pub mod execution;
 pub mod fee_router;
+pub mod submit;
 pub mod uniswap;
 
 use alloy_provider::{Provider, transport::TransportError};
@@ -12,8 +13,9 @@ pub use alloy_primitives::{Address, B256, Bytes, U256};
 pub use dex::{Dex, DiscoverPools, Error, ResolvePool, Result};
 pub use fee_router::{
     BuyWith, FeeRouter, FundingQuoteFailure, FundingReport, PairSwap, PreparedSwap, PriceImpact,
-    PriceImpactUnavailable, RouteHop, TradeSide, Trader,
+    PriceImpactUnavailable, RouteHop, TradeSide, Trader, WalletTrader,
 };
+pub use submit::{BloxrouteSubmitter, SubmitError, Submitter};
 
 use dex::{Currency, Token};
 

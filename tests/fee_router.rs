@@ -646,6 +646,8 @@ async fn v4_pair_selection_preserves_the_key_and_hook_data() {
         returned(&rpc, (U160::from(1), I24::ZERO, U24::ZERO, U24::ZERO));
     }
     returned(&rpc, (U256::from(2000), U256::from(50000)));
+    returned(&rpc, (U160::from(1) << 96, I24::ZERO, U24::ZERO, U24::ZERO));
+    pons_launch(&rpc, AC, NVDA, 300);
     let UniswapPool::V4(pool) = route().remove(1).pool else {
         unreachable!()
     };
@@ -673,6 +675,30 @@ async fn v4_pair_selection_preserves_the_key_and_hook_data() {
     assert_eq!(call.hops[0].hookData, hook_data);
     assert_eq!(call.request.tokenIn, NVDA);
     assert_eq!(call.request.tokenOut, AC);
+    let impact = prepared.price_impact.unwrap();
+    assert_eq!(impact.hook_fees[0].as_ref().unwrap().hook_fee_bps, 100);
+    assert_eq!(impact.hook_fees[0].as_ref().unwrap().creator_tax_bps, 300);
+}
+
+fn pons_launch(rpc: &Asserter, memecoin: Address, quote: Address, tax: u16) {
+    returned(
+        rpc,
+        (
+            true,
+            memecoin < quote,
+            memecoin,
+            quote,
+            OWNER,
+            OWNER,
+            RECIPIENT,
+            tax,
+            3000u16,
+            5000u16,
+            100u16,
+            300u16,
+            false,
+        ),
+    );
 }
 
 fn pair_request(token_address: Address, side: TradeSide) -> PairSwap {
@@ -736,43 +762,64 @@ async fn eth_buy_builds_one_funded_v4_transaction_and_keeps_discovery_failures()
 
 #[tokio::test]
 async fn funded_preview_combines_both_pool_prices_and_fees() {
-    let (router, rpc) = router_with_rpc(100).await.unwrap();
-    let mut request = v4_buy_setup(&rpc);
-    let V4PoolLookup::Key(key) = &mut request.pair else {
-        unreachable!()
-    };
-    key.hooks = Address::ZERO;
-    funding_connection(&rpc);
-    returned(&rpc, Address::ZERO);
-    returned(&rpc, pair_request(NVDA, TradeSide::Buy).pair);
-    v3_pool(&rpc);
-    returned(&rpc, Address::ZERO);
-    returned(&rpc, Address::ZERO);
-    v3_pool(&rpc);
-    returned(
-        &rpc,
-        (U256::from(9000), U160::from(1), 0u32, U256::from(50000)),
-    );
-    returned(&rpc, (U160::from(1), I24::ZERO, U24::ZERO, U24::ZERO));
-    returned(&rpc, (U256::from(8905), U256::from(50000)));
-    v3_price(&rpc);
-    returned(&rpc, (U160::from(1) << 96, I24::ZERO, U24::ZERO, U24::ZERO));
+    for (hooked, output, after_fees, total_cost, minimum) in [
+        (false, 8905, 9895, 1095, 8815),
+        (true, 8549, 9499, 1451, 8463),
+    ] {
+        let (router, rpc) = router_with_rpc(100).await.unwrap();
+        let mut request = v4_buy_setup(&rpc);
+        let V4PoolLookup::Key(key) = &mut request.pair else {
+            unreachable!()
+        };
+        if !hooked {
+            key.hooks = Address::ZERO;
+        }
+        funding_connection(&rpc);
+        returned(&rpc, Address::ZERO);
+        returned(&rpc, pair_request(NVDA, TradeSide::Buy).pair);
+        v3_pool(&rpc);
+        returned(&rpc, Address::ZERO);
+        returned(&rpc, Address::ZERO);
+        v3_pool(&rpc);
+        returned(
+            &rpc,
+            (U256::from(9000), U160::from(1), 0u32, U256::from(50000)),
+        );
+        returned(&rpc, (U160::from(1), I24::ZERO, U24::ZERO, U24::ZERO));
+        returned(&rpc, (U256::from(output), U256::from(50000)));
+        v3_price(&rpc);
+        returned(&rpc, (U160::from(1) << 96, I24::ZERO, U24::ZERO, U24::ZERO));
+        if hooked {
+            pons_launch(&rpc, AC, NVDA, 300);
+        }
 
-    let prepared = router
-        .trader(OWNER)
-        .prepare_v4_swap(request, V4QuoteOptions::default(), limits())
-        .await
-        .unwrap();
-    let impact = prepared.price_impact.as_ref().unwrap();
-    assert_eq!(impact.market_amount_out, U256::from(10000));
-    assert_eq!(impact.market_amount_out_after_fees, U256::from(9895));
-    assert_eq!(impact.price_impact_bps, 1000);
-    assert_eq!(impact.total_cost_bps, 1095);
-    assert_eq!(impact.pool_fee_pips, [500, 0]);
-    assert_eq!(prepared.quote.request.pool.len(), 2);
-    assert_eq!(prepared.router_fee_amount, U256::from(100));
-    assert_eq!(prepared.minimum_amount_out(), U256::from(8815));
-    assert!(rpc.read_q().is_empty());
+        let prepared = router
+            .trader(OWNER)
+            .prepare_v4_swap(request, V4QuoteOptions::default(), limits())
+            .await
+            .unwrap();
+        let impact = prepared.price_impact.as_ref().unwrap();
+        assert_eq!(impact.market_amount_out, U256::from(10000));
+        assert_eq!(
+            impact.market_amount_out_after_fees,
+            Some(U256::from(after_fees))
+        );
+        assert_eq!(impact.price_impact_bps, total_cost);
+        assert_eq!(impact.total_cost_bps, total_cost);
+        assert_eq!(impact.pool_fee_pips, [Some(500), Some(0)]);
+        assert_eq!(
+            impact.hook_fees[1].as_ref().unwrap().hook_fee_bps,
+            if hooked { 100 } else { 0 }
+        );
+        assert_eq!(
+            impact.hook_fees[1].as_ref().unwrap().creator_tax_bps,
+            if hooked { 300 } else { 0 }
+        );
+        assert_eq!(prepared.quote.request.pool.len(), 2);
+        assert_eq!(prepared.router_fee_amount, U256::from(100));
+        assert_eq!(prepared.minimum_amount_out(), U256::from(minimum));
+        assert!(rpc.read_q().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -941,6 +988,8 @@ async fn native_v4_buy_uses_no_funding_hop() {
     key.currency0 = Address::ZERO;
     returned(&rpc, (U160::from(1), I24::ZERO, U24::ZERO, U24::ZERO));
     returned(&rpc, (U256::from(2000), U256::from(50000)));
+    returned(&rpc, (U160::from(1) << 96, I24::ZERO, U24::ZERO, U24::ZERO));
+    pons_launch(&rpc, AC, Address::ZERO, 0);
     let prepared = router
         .trader(OWNER)
         .prepare_v4_swap(request, V4QuoteOptions::default(), limits())
@@ -960,7 +1009,44 @@ async fn native_v4_buy_uses_no_funding_hop() {
         (Address::ZERO, AC)
     );
     assert!(prepared.funding.is_none());
+    assert!(prepared.price_impact.is_ok());
     assert!(rpc.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn unknown_and_dynamic_v4_hooks_return_fee_inclusive_impact_with_the_quote() {
+    for dynamic in [false, true] {
+        let (router, rpc) = router_with_rpc(100).await.unwrap();
+        let mut request = v4_buy_setup(&rpc);
+        let V4PoolLookup::Key(key) = &mut request.pair else {
+            unreachable!()
+        };
+        key.currency0 = Address::ZERO;
+        key.hooks = Address::repeat_byte(9);
+        if dynamic {
+            key.fee = U24::from(0x800000);
+        }
+        let expected_key = key.clone();
+        returned(&rpc, (U160::from(1) << 96, I24::ZERO, U24::ZERO, U24::ZERO));
+        returned(&rpc, (U256::from(5000), U256::from(50000)));
+        returned(&rpc, (U160::from(1) << 96, I24::ZERO, U24::ZERO, U24::ZERO));
+        let prepared = router
+            .trader(OWNER)
+            .prepare_v4_swap(request, V4QuoteOptions::default(), limits())
+            .await
+            .unwrap();
+        let impact = prepared.price_impact.as_ref().unwrap();
+        assert_eq!(impact.market_amount_out, U256::from(10000));
+        assert_eq!(impact.price_impact_bps, 5000);
+        assert_eq!(impact.hook_fees, [None]);
+        assert_eq!(prepared.quote.amount_out, U256::from(5000));
+        assert_eq!(prepared.minimum_amount_out(), U256::from(4950));
+        let call =
+            swapWithFeeCall::abi_decode(prepared.plan.transaction.input.input().unwrap()).unwrap();
+        assert_eq!(call.hops[0].key.hooks, expected_key.hooks);
+        assert_eq!(call.hops[0].key.fee, expected_key.fee);
+        assert!(rpc.read_q().is_empty());
+    }
 }
 
 #[tokio::test]

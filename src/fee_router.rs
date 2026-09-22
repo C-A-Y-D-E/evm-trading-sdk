@@ -6,7 +6,7 @@ use futures_util::try_join;
 
 mod price_impact;
 mod trader;
-pub use price_impact::{PriceImpact, PriceImpactUnavailable};
+pub use price_impact::{HookFees, PriceImpact, PriceImpactUnavailable};
 pub use trader::{
     BuyWith, FundingQuoteFailure, FundingReport, PairSwap, PreparedSwap, TradeSide, Trader,
     WalletTrader,

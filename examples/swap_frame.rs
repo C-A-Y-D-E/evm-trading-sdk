@@ -324,8 +324,11 @@ async fn prepare(
     );
     match &prepared.price_impact {
         Ok(impact) => println!(
-            "Estimated route impact excluding fees: {} bps; total cost including fees: {} bps; pool fees per hop: {:?} pips",
-            impact.price_impact_bps, impact.total_cost_bps, impact.pool_fee_pips
+            "Price impact including fees: {} bps; pre-swap pool-price reference: {} output base units; known core fees per hop: {:?} pips; known hook fees per hop: {:?}",
+            impact.price_impact_bps,
+            impact.market_amount_out,
+            impact.pool_fee_pips,
+            impact.hook_fees
         ),
         Err(reason) => println!("Price impact unavailable: {reason}"),
     }

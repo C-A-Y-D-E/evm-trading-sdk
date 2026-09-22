@@ -12,8 +12,8 @@ use futures_util::try_join;
 pub use alloy_primitives::{Address, B256, Bytes, U256};
 pub use dex::{Dex, DiscoverPools, Error, ResolvePool, Result};
 pub use fee_router::{
-    BuyWith, FeeRouter, FundingQuoteFailure, FundingReport, PairSwap, PreparedSwap, PriceImpact,
-    PriceImpactUnavailable, RouteHop, TradeSide, Trader, WalletTrader,
+    BuyWith, FeeRouter, FundingQuoteFailure, FundingReport, HookFees, PairSwap, PreparedSwap,
+    PriceImpact, PriceImpactUnavailable, RouteHop, TradeSide, Trader, WalletTrader,
 };
 pub use submit::{BloxrouteSubmitter, SubmitError, Submitter};
 

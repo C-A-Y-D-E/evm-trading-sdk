@@ -324,7 +324,7 @@ async fn prepare(
     );
     match &prepared.price_impact {
         Ok(impact) => println!(
-            "Price impact including fees: {} bps; pre-swap pool-price reference: {} output base units; known core fees per hop: {:?} pips; known hook fees per hop: {:?}",
+            "Price impact excluding fees and taxes: {} bps; pre-swap pool-price reference after platform fee: {} output base units; known core fees per hop: {:?} pips; known hook fees per hop: {:?}",
             impact.price_impact_bps,
             impact.market_amount_out,
             impact.pool_fee_pips,

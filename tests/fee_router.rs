@@ -762,9 +762,9 @@ async fn eth_buy_builds_one_funded_v4_transaction_and_keeps_discovery_failures()
 
 #[tokio::test]
 async fn funded_preview_combines_both_pool_prices_and_fees() {
-    for (hooked, output, after_fees, total_cost, minimum) in [
-        (false, 8905, 9895, 1095, 8815),
-        (true, 8549, 9499, 1451, 8463),
+    for (hooked, output, after_fees, price_impact, total_cost, minimum) in [
+        (false, 8905, 9895, 1000, 1095, 8815),
+        (true, 8549, 9499, 1000, 1451, 8463),
     ] {
         let (router, rpc) = router_with_rpc(100).await.unwrap();
         let mut request = v4_buy_setup(&rpc);
@@ -799,12 +799,12 @@ async fn funded_preview_combines_both_pool_prices_and_fees() {
             .await
             .unwrap();
         let impact = prepared.price_impact.as_ref().unwrap();
-        assert_eq!(impact.market_amount_out, U256::from(10000));
+        assert_eq!(impact.market_amount_out, U256::from(9900));
         assert_eq!(
             impact.market_amount_out_after_fees,
             Some(U256::from(after_fees))
         );
-        assert_eq!(impact.price_impact_bps, total_cost);
+        assert_eq!(impact.price_impact_bps, price_impact);
         assert_eq!(impact.total_cost_bps, total_cost);
         assert_eq!(impact.pool_fee_pips, [Some(500), Some(0)]);
         assert_eq!(
@@ -1014,7 +1014,7 @@ async fn native_v4_buy_uses_no_funding_hop() {
 }
 
 #[tokio::test]
-async fn unknown_and_dynamic_v4_hooks_return_fee_inclusive_impact_with_the_quote() {
+async fn unknown_v4_fees_keep_the_quote_without_claiming_fee_excluded_impact() {
     for dynamic in [false, true] {
         let (router, rpc) = router_with_rpc(100).await.unwrap();
         let mut request = v4_buy_setup(&rpc);
@@ -1035,10 +1035,10 @@ async fn unknown_and_dynamic_v4_hooks_return_fee_inclusive_impact_with_the_quote
             .prepare_v4_swap(request, V4QuoteOptions::default(), limits())
             .await
             .unwrap();
-        let impact = prepared.price_impact.as_ref().unwrap();
-        assert_eq!(impact.market_amount_out, U256::from(10000));
-        assert_eq!(impact.price_impact_bps, 5000);
-        assert_eq!(impact.hook_fees, [None]);
+        assert!(matches!(
+            prepared.price_impact,
+            Err(evm_trading_sdk::PriceImpactUnavailable::HookPricing)
+        ));
         assert_eq!(prepared.quote.amount_out, U256::from(5000));
         assert_eq!(prepared.minimum_amount_out(), U256::from(4950));
         let call =

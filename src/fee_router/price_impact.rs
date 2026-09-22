@@ -22,10 +22,10 @@ pub struct HookFees {
 
 /// Same-block route estimate. Amounts are output base units, rounded down only at the end.
 /// Basis points truncate toward zero; negative impact means a better-than-reference quote.
-/// `market_amount_out` uses gross input and the product of pool spot prices, excluding fees.
-/// `price_impact_bps` compares quoted output to that gross reference, including all quoted fees.
-/// `total_cost_bps` is the same value, retained for compatibility. Gas is excluded.
-/// Fee breakdown fields are optional and never determine whether impact can be calculated.
+/// `market_amount_out` values input after the platform fee at the product of pool spot prices.
+/// `price_impact_bps` compares quoted output to the reference after all modeled fees and taxes.
+/// `total_cost_bps` uses gross input instead, so it also includes the platform fee. Gas is excluded.
+/// Excluding fees requires known pool and hook rates; unknown terms make impact unavailable.
 /// Pool fees are in millionths (100 pips = 1 bp). Gas and external market prices are excluded.
 /// `hook_fees` lists known output fee/tax rates per hop; None means unknown, not zero.
 /// V4 uses core slot0 as its reference even when a hook uses other pricing; this is not an oracle valuation.
@@ -42,7 +42,7 @@ pub struct PriceImpact {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PriceImpactUnavailable {
-    #[error("V4 swap hook or dynamic fee has no supported pricing model")]
+    #[error("pool or hook fees are unknown; fee-excluded price impact cannot be calculated")]
     HookPricing,
     #[error("hook launch configuration does not match the selected pool or supported fee model")]
     HookConfiguration,
@@ -66,6 +66,12 @@ pub(super) async fn estimate<P: Provider>(
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
+    if references
+        .iter()
+        .any(|reference| reference.fee_pips.is_none() || reference.hook_fees.is_none())
+    {
+        return Err(PriceImpactUnavailable::HookPricing);
+    }
     calculate(&references, gross_input, net_input, amount_out)
         .ok_or(PriceImpactUnavailable::Arithmetic)
 }
@@ -209,7 +215,7 @@ async fn reference<P: Provider>(
                 .then(|| protocol + lp - (u64::from(protocol) * u64::from(lp) / 1_000_000) as u32);
             Reference {
                 fee_pips: fee,
-                hook_fees: hook_fees.ok(),
+                hook_fees: Some(hook_fees?),
                 ..sqrt_reference(state.sqrtPriceX96, zero_for_one, 0)
             }
         }
@@ -242,16 +248,19 @@ fn calculate(
     net: U256,
     output: U256,
 ) -> Option<PriceImpact> {
-    let mut market = Fraction::amount(gross);
+    let mut market = Fraction::amount(net);
+    let mut gross_market = Fraction::amount(gross);
     for reference in references {
         market.multiply(reference.numerator, reference.denominator)?;
+        gross_market.multiply(reference.numerator, reference.denominator)?;
     }
-    let price_impact_bps = market.difference_bps(output)?;
+    let after_fees = after_fee_reference(references, net)?;
+    let price_impact_bps = after_fees.difference_bps(output)?;
     Some(PriceImpact {
         market_amount_out: market.floor()?,
-        market_amount_out_after_fees: after_fee_reference(references, net),
+        market_amount_out_after_fees: Some(after_fees.floor()?),
         price_impact_bps,
-        total_cost_bps: price_impact_bps,
+        total_cost_bps: gross_market.difference_bps(output)?,
         pool_fee_pips: references
             .iter()
             .map(|reference| reference.fee_pips)
@@ -263,7 +272,7 @@ fn calculate(
     })
 }
 
-fn after_fee_reference(references: &[Reference], net: U256) -> Option<U256> {
+fn after_fee_reference(references: &[Reference], net: U256) -> Option<Fraction> {
     let mut after_fees = Fraction::amount(net);
     for reference in references {
         after_fees.multiply(reference.numerator, reference.denominator)?;
@@ -279,7 +288,7 @@ fn after_fee_reference(references: &[Reference], net: U256) -> Option<U256> {
             Wide::from(10_000),
         )?;
     }
-    after_fees.floor()
+    Some(after_fees)
 }
 
 struct Fraction {
@@ -373,6 +382,53 @@ mod tests {
     }
 
     #[test]
+    fn platform_fee_is_excluded_from_impact_and_retained_in_total_cost() {
+        for (gross, net, output, expected_impact, expected_total) in [
+            (10000, 9900, 9900, 0, 100),
+            (10000, 9900, 8910, 1000, 1090),
+            (101, 100, 100, 0, 99),
+            (10000, 10000, 9000, 1000, 1000),
+        ] {
+            let impact = calculate(
+                &[ratio(2, 1, 0), ratio(1, 2, 0)],
+                U256::from(gross),
+                U256::from(net),
+                U256::from(output),
+            )
+            .unwrap();
+            assert_eq!(impact.market_amount_out, U256::from(net));
+            assert_eq!(impact.price_impact_bps, expected_impact);
+            assert_eq!(impact.total_cost_bps, expected_total);
+        }
+        assert!(calculate(&[ratio(1, 1, 0)], U256::from(100), U256::ZERO, U256::ZERO).is_none());
+    }
+
+    #[test]
+    fn platform_pool_hook_fees_and_creator_tax_do_not_count_as_impact() {
+        let mut first = ratio(2, 1, 10000);
+        first.hook_fees = Some(HookFees {
+            hook_fee_bps: 100,
+            creator_tax_bps: 300,
+        });
+        let references = [first, ratio(1, 2, 20000)];
+        for (output, impact_bps) in [(92207808, 0), (46103904, 5000)] {
+            let impact = calculate(
+                &references,
+                U256::from(100000000),
+                U256::from(99000000),
+                U256::from(output),
+            )
+            .unwrap();
+            assert_eq!(
+                impact.market_amount_out_after_fees,
+                Some(U256::from(92207808))
+            );
+            assert_eq!(impact.price_impact_bps, impact_bps);
+            assert!(impact.total_cost_bps > impact.price_impact_bps);
+        }
+    }
+
+    #[test]
     fn route_impact_compounds_and_separates_fees() {
         let impact = calculate(
             &[ratio(2, 1, 10_000), ratio(3, 1, 20_000)],
@@ -381,9 +437,9 @@ mod tests {
             U256::from(57629),
         )
         .unwrap();
-        assert_eq!(impact.market_amount_out, U256::from(60000));
+        assert_eq!(impact.market_amount_out, U256::from(59400));
         assert_eq!(impact.market_amount_out_after_fees, Some(U256::from(57629)));
-        assert_eq!(impact.price_impact_bps, 395);
+        assert_eq!(impact.price_impact_bps, 0);
         assert_eq!(impact.total_cost_bps, 395);
         assert_eq!(impact.pool_fee_pips, [Some(10000), Some(20000)]);
         let impact = calculate(
@@ -397,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn half_the_input_value_is_fifty_percent_for_every_pool_and_hook() {
+    async fn pool_fees_are_excluded_and_unknown_hooks_remain_explicit() {
         let rpc = Asserter::new();
         let client = client(&rpc).await;
         let mut pools = hops();
@@ -424,34 +480,32 @@ mod tests {
                     (U160::from(1) << 96, I24::ZERO, U24::ZERO, U24::from(3000)).abi_encode(),
                 )),
             }
+            let output = match &hop.pool {
+                UniswapPool::V3(_) => 999500,
+                _ => 997000,
+            };
             let impact = estimate(
                 &client,
                 std::slice::from_ref(&hop),
                 B256::repeat_byte(7),
-                U256::from(100),
-                U256::from(99),
-                U256::from(50),
+                U256::from(2000000),
+                U256::from(2000000),
+                U256::from(output),
             )
-            .await
-            .unwrap();
-            assert_eq!(impact.market_amount_out, U256::from(100));
-            assert_eq!(impact.price_impact_bps, 5000);
-            assert_eq!(impact.total_cost_bps, 5000);
-            if let UniswapPool::V4(pool) = hop.pool {
-                if !pool.key.hooks.is_zero() {
-                    assert_eq!(impact.hook_fees, [None]);
-                    assert_eq!(impact.market_amount_out_after_fees, None);
-                }
-                if pool.key.fee.to::<u32>() == 0x800000 {
-                    assert_eq!(impact.pool_fee_pips, [None]);
-                }
+            .await;
+            if matches!(&hop.pool, UniswapPool::V4(pool) if !pool.key.hooks.is_zero()) {
+                assert!(matches!(impact, Err(PriceImpactUnavailable::HookPricing)));
+            } else {
+                let impact = impact.unwrap();
+                assert_eq!(impact.market_amount_out, U256::from(2000000));
+                assert_eq!(impact.price_impact_bps, 5000);
             }
         }
         assert!(rpc.read_q().is_empty());
     }
 
     #[tokio::test]
-    async fn failed_optional_hook_reads_do_not_hide_price_impact() {
+    async fn missing_hook_terms_keep_the_reason_for_unavailable_impact() {
         let rpc = Asserter::new();
         let client = client(&rpc).await;
         for invalid_terms in [false, true] {
@@ -473,27 +527,28 @@ mod tests {
                 U256::from(99),
                 U256::from(50),
             )
-            .await
-            .unwrap();
-            assert_eq!(impact.price_impact_bps, 5000);
-            assert_eq!(impact.market_amount_out_after_fees, None);
-            assert_eq!(impact.hook_fees, [None]);
+            .await;
+            if invalid_terms {
+                assert!(matches!(
+                    impact,
+                    Err(PriceImpactUnavailable::HookConfiguration)
+                ));
+            } else {
+                assert!(matches!(impact, Err(PriceImpactUnavailable::State(_))));
+            }
         }
         assert!(rpc.read_q().is_empty());
     }
 
     #[test]
-    fn optional_fee_arithmetic_does_not_change_the_gross_reference() {
+    fn zero_after_fee_reference_has_no_price_impact() {
         let impact = calculate(
             &[ratio(2, 1, 1_000_000)],
             U256::from(100),
-            U256::ZERO,
             U256::from(100),
-        )
-        .unwrap();
-        assert_eq!(impact.market_amount_out, U256::from(200));
-        assert_eq!(impact.price_impact_bps, 5000);
-        assert_eq!(impact.market_amount_out_after_fees, None);
+            U256::from(100),
+        );
+        assert!(impact.is_none());
     }
 
     #[test]
@@ -682,7 +737,7 @@ mod tests {
                 impact.market_amount_out_after_fees,
                 Some(U256::from(950_400))
             );
-            assert_eq!(impact.price_impact_bps, 1446);
+            assert_eq!(impact.price_impact_bps, 1000);
             assert_eq!(impact.total_cost_bps, 1446);
             assert_eq!(impact.pool_fee_pips, [Some(10_000)]);
             assert_eq!(
@@ -874,8 +929,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(impact.market_amount_out, U256::from(100));
-        assert_eq!(impact.price_impact_bps, 2000);
+        assert_eq!(impact.market_amount_out, U256::from(99));
+        assert_eq!(impact.price_impact_bps, 1870);
         rpc.push_failure_msg("state unavailable");
         assert!(matches!(
             estimate(

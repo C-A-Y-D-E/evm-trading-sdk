@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     match &prepared.price_impact {
         Ok(impact) => println!(
-            "Price impact including fees: {} bps; pre-swap pool-price reference: {} output base units; known core fees: {:?} pips; known hook fees: {:?}",
+            "Price impact excluding fees and taxes: {} bps; pre-swap pool-price reference after platform fee: {} output base units; known core fees: {:?} pips; known hook fees: {:?}",
             impact.price_impact_bps,
             impact.market_amount_out,
             impact.pool_fee_pips,
